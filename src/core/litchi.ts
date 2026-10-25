@@ -1,6 +1,6 @@
 import { Mission } from './missions';
 import { Projection, XY } from './projection';
-import { at } from './profile';
+import { ItinWp, buildItinerary } from './itinerary';
 
 export const LITCHI_HEADER = [
   'latitude',
@@ -42,45 +42,32 @@ export interface LitchiWaypoint {
   photoDist: number;
 }
 
-function headingDeg(dx: number, dy: number): number {
-  // Compass heading: 0 = north, clockwise.
-  const h = (Math.atan2(dx, dy) * 180) / Math.PI;
-  return Math.round(((h % 360) + 360) % 360);
-}
-
+/**
+ * Litchi waypoints for a mission, taken from its exported itinerary.
+ * Photo legs carry the interval; other legs carry -1, which in Litchi means "use the mission setting",
+ * so the mission-level photo interval must be left off in Litchi (see the export instructions).
+ */
 export function missionWaypoints(m: Mission, proj: Projection, s: ExportSettings, home?: XY): LitchiWaypoint[] {
-  const wps: LitchiWaypoint[] = [];
-  const photo = (on: boolean) => ({
-    photoTime: on && s.trigger === 'time' ? s.photoIntervalS : -1,
-    photoDist: on && s.trigger === 'distance' ? s.photoSpacingM : -1,
-  });
-  const first = m.lines[0];
-  if (m.climbAltM !== undefined && home && first) {
-    // Climb vertically above takeoff before heading out, so the leg to the first line clears the trees.
-    const [lon, lat] = proj.toLngLat(home);
-    wps.push({
+  const it: ItinWp[] =
+    m.itinerary ??
+    buildItinerary(
+      m.lines.map((l) => ({ ...l, wps: l.wps ?? [{ t: 0, alt: s.altitudeM }, { t: 1, alt: s.altitudeM }] })),
+      home ?? m.lines[0]?.start ?? [0, 0],
+      { speedMs: s.speedMs, transitSpeedMs: s.speedMs, climbAltM: m.climbAltM ?? s.altitudeM },
+    ).filter((w) => home !== undefined || w.kind !== 'climb');
+  return it.map((w) => {
+    const [lon, lat] = proj.toLngLat(w.xy);
+    return {
       lat,
       lon,
-      alt: m.climbAltM,
-      heading: headingDeg(first.start[0] - home[0], first.start[1] - home[1]),
-      speed: s.speedMs,
+      alt: w.alt,
+      heading: w.heading,
+      speed: w.speed,
       gimbalPitch: s.gimbalPitch,
-      ...photo(false),
-    });
-  }
-  for (const l of m.lines) {
-    const h = headingDeg(l.end[0] - l.start[0], l.end[1] - l.start[1]);
-    const along = l.wps ?? [
-      { t: 0, alt: s.altitudeM },
-      { t: 1, alt: s.altitudeM },
-    ];
-    along.forEach((w, i) => {
-      const [lon, lat] = proj.toLngLat(at(l, w.t));
-      // Photos run on every segment from the line start to the line end; none on the turn after it.
-      wps.push({ lat, lon, alt: w.alt, heading: h, speed: s.speedMs, gimbalPitch: s.gimbalPitch, ...photo(i < along.length - 1) });
-    });
-  }
-  return wps;
+      photoTime: w.photo && s.trigger === 'time' ? s.photoIntervalS : -1,
+      photoDist: w.photo && s.trigger === 'distance' ? s.photoSpacingM : -1,
+    };
+  });
 }
 
 const r = (v: number, d: number) => Number(v.toFixed(d));

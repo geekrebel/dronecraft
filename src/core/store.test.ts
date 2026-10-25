@@ -100,4 +100,19 @@ describe('plan store', () => {
     expect(s.currentId()).toBe(a.id);
     expect(s.list().length).toBe(2);
   });
+
+  it('reports when a write fails and recovers on the next good write', () => {
+    let fail = false;
+    const kv = new MemKV();
+    const flaky: KV = { getItem: (k) => kv.getItem(k), setItem: (k, v) => { if (fail) throw new Error('QuotaExceededError'); kv.setItem(k, v); } };
+    const s = new PlanStore(flaky, clock());
+    const a = s.create(doc('A'));
+    expect(s.saved).toBe(true);
+    fail = true;
+    s.save({ ...a, name: 'B' });
+    expect(s.saved).toBe(false);
+    fail = false;
+    s.save({ ...a, name: 'C' });
+    expect(s.saved).toBe(true);
+  });
 });

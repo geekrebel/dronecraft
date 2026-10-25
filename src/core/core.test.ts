@@ -202,8 +202,15 @@ describe('litchi csv', () => {
     const i = LITCHI_HEADER.indexOf('curvesize(m)');
     for (const r of rows.slice(1)) expect(Number(r.split(',')[i])).toBeGreaterThan(0);
   });
-  it('line start carries the interval, line end carries -1', () => {
+  it('first row is the climb over takeoff at transit speed with photos off', () => {
     const back = parseLitchiCsv(csv);
+    expect(m.itinerary![0].kind).toBe('climb');
+    expect(back[0].speed).toBe(10);
+    expect(back[0].photoDist).toBe(-1);
+    expect(back[0].photoTime).toBe(-1);
+  });
+  it('line start carries the interval, line end carries -1', () => {
+    const back = parseLitchiCsv(csv).slice(1);
     for (let i = 0; i < back.length; i += 2) {
       expect(back[i].photoDist).toBeCloseTo(plan.photoSpacingM, 1);
       expect(back[i].photoTime).toBe(-1);
@@ -212,8 +219,8 @@ describe('litchi csv', () => {
   });
   it('time mode writes the time interval instead', () => {
     const back = parseLitchiCsv(toLitchiCsv(missionWaypoints(m, plan.proj, { ...settings, trigger: 'time' })));
-    expect(back[0].photoDist).toBe(-1);
-    expect(back[0].photoTime).toBeCloseTo(plan.photoIntervalS, 1);
+    expect(back[1].photoDist).toBe(-1);
+    expect(back[1].photoTime).toBeCloseTo(plan.photoIntervalS, 1);
   });
   it('round trip preserves coordinates, altitude and speed', () => {
     const back = parseLitchiCsv(csv);
@@ -221,13 +228,15 @@ describe('litchi csv', () => {
     back.forEach((w, i) => {
       expect(w.lat).toBeCloseTo(wps[i].lat, 6);
       expect(w.lon).toBeCloseTo(wps[i].lon, 6);
-      expect(w.alt).toBe(80);
-      expect(w.speed).toBe(5);
       expect(w.gimbalPitch).toBe(-90);
+      if (i > 0) {
+        expect(w.alt).toBe(80);
+        expect(w.speed).toBe(5);
+      }
     });
   });
   it('heading points along the line (east line = 90 deg)', () => {
-    const east = { ...m, lines: [{ start: [0, 0] as XY, end: [100, 0] as XY }] };
+    const east = { ...m, itinerary: undefined, lines: [{ start: [0, 0] as XY, end: [100, 0] as XY }] };
     expect(missionWaypoints(east, plan.proj, settings)[0].heading).toBe(90);
   });
 });
@@ -239,7 +248,7 @@ describe('checks', () => {
     expect(grade(10, 9, 10)).toBe('caution');
     expect(grade(10.01, 9, 10)).toBe('fail');
   });
-  const base = { ...DEFAULT_INPUT, polygon: blockLL(400, 300), home: proj0.toLngLat([0, 0]) };
+  const base = { ...DEFAULT_INPUT, polygon: blockLL(400, 300), home: proj0.toLngLat([0, 0]), flatGroundConfirmed: true };
   const status = (p: ReturnType<typeof buildPlan>, id: string) => p.checks.find((c) => c.id === id)?.status;
 
   it('photo interval below 2 s fails and blocks export', () => {
@@ -264,10 +273,14 @@ describe('checks', () => {
   it('altitude over limit fails', () => {
     expect(status(buildPlan({ ...base, altitudeM: 130 }), 'height')).toBe('fail');
   });
-  it('no elevation data and unchecked GEO zone are cautions, not failures', () => {
-    const p = buildPlan(base);
-    expect(status(p, 'terrain')).toBe('caution');
-    expect(status(p, 'geozone')).toBe('caution');
+  it('without elevation data, export is blocked unless the site is confirmed flat', () => {
+    const blocked = buildPlan({ ...base, flatGroundConfirmed: false });
+    expect(status(blocked, 'terrain')).toBe('fail');
+    expect(blocked.exportBlocked).toBe(true);
+    const flat = buildPlan(base);
+    expect(status(flat, 'terrain')).toBe('caution');
+    expect(status(flat, 'geozone')).toBe('caution');
+    expect(flat.exportBlocked).toBe(false);
   });
   it('time trigger reports worst-case overlap', () => {
     const p = buildPlan({ ...base, trigger: 'time' });

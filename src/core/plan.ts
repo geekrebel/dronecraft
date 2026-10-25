@@ -2,7 +2,16 @@ import { AIR_2S, Camera, footprint, gsd, lineSpacing, overlapForSpacing, photoSp
 import { Line, generateLines, longestEdgeAngle } from './grid';
 import { DEFAULT_FLIGHT, FlightSettings, Mission, budgetS, splitMissions } from './missions';
 import { LngLat, Projection, XY, centroid, dist, makeProjection } from './projection';
-import { PathPt, at, maxAlong, maxVerticalSpeed, pathStats, profileLine } from './profile';
+import { PathPt, at, maxAlong, pathStats, profileLine } from './profile';
+import {
+  ItinWp,
+  LITCHI_MAX_LEG_M,
+  LITCHI_MIN_LEG_M,
+  buildItinerary,
+  itineraryMaxVertical,
+  itineraryTime,
+  legExtremes,
+} from './itinerary';
 import type { Terrain } from './terrain';
 
 export interface PlanInput {
@@ -27,6 +36,8 @@ export interface PlanInput {
   maxRangeM: number;
   maxAltitudeM: number;
   geoZoneChecked: boolean;
+  /** The user confirms the site is flat, so planning without elevation data is acceptable. */
+  flatGroundConfirmed: boolean;
 }
 
 export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
@@ -45,7 +56,54 @@ export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
   maxRangeM: 1000,
   maxAltitudeM: 120,
   geoZoneChecked: false,
+  flatGroundConfirmed: false,
 };
+
+/** Accepted range for each numeric setting. Imports outside these are rejected; the planner refuses them too. */
+export const SETTING_RANGES: Record<string, [number, number]> = {
+  altitudeM: [10, 500],
+  canopyM: [0, 100],
+  minClearanceM: [5, 100],
+  frontOverlap: [0.5, 0.95],
+  sideOverlap: [0.5, 0.95],
+  speedMs: [1, 15],
+  gridAngleDeg: [-360, 360],
+  bufferM: [0, 100],
+  gimbalPitch: [-90, 0],
+  batteryMin: [5, 45],
+  reservePct: [0.1, 0.6],
+  maxRangeM: [100, 5000],
+  maxAltitudeM: [30, 500],
+};
+
+/** Planning refuses inputs it cannot handle safely; the message is meant for the user. */
+export class PlanError extends Error {}
+
+export const MAX_AREA_HA = 2000;
+export const MAX_LINES = 2000;
+
+/** Litchi limits the plan must respect (flylitchi.com/help#waypoint, legacy Hub importer). */
+export const LITCHI_MAX_ALT_M = 500;
+export const LITCHI_MAX_INTERVAL = 100;
+/** Vertical speed the climb-out leg is designed for, m/s. */
+export const CLIMB_OUT_VERTICAL_MS = 3;
+export const RETURN_SPEED_MS = 10;
+
+const okLngLat = (p: unknown): p is LngLat =>
+  Array.isArray(p) && p.length >= 2 && [p[0], p[1]].every((v) => typeof v === 'number' && Number.isFinite(v)) && Math.abs(p[0]) <= 180 && Math.abs(p[1]) <= 90;
+
+export function validateInput(input: PlanInput) {
+  if (!Array.isArray(input.polygon) || input.polygon.length < 3 || !input.polygon.every(okLngLat))
+    throw new PlanError('The area needs at least 3 corners with valid coordinates.');
+  if (!okLngLat(input.home)) throw new PlanError('The takeoff point has invalid coordinates.');
+  for (const [k, [lo, hi]] of Object.entries(SETTING_RANGES)) {
+    const v = (input as unknown as Record<string, unknown>)[k];
+    if (k === 'gridAngleDeg' && v === 'auto') continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi)
+      throw new PlanError(`Setting ${k} is ${String(v)}, outside the allowed ${lo} to ${hi}.`);
+  }
+  if (input.trigger !== 'distance' && input.trigger !== 'time') throw new PlanError('Photo trigger must be distance or time.');
+}
 
 /** Terrain following tolerance and sampling. */
 export const TERRAIN_TOL_M = 5;
@@ -100,23 +158,27 @@ export interface Plan {
 class MissingElevation extends Error {}
 
 export function buildPlan(input: PlanInput, terrain?: Terrain | null): Plan {
+  validateInput(input);
   if (terrain) {
     try {
       return build(input, terrain);
     } catch (e) {
       if (!(e instanceof MissingElevation)) throw e;
-      return { ...build(input, null), terrainStatus: 'incomplete' };
+      return build(input, null, 'incomplete');
     }
   }
   return build(input, null);
 }
 
-function build(input: PlanInput, terrain: Terrain | null): Plan {
+function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'incomplete' = 'none'): Plan {
   const camera = input.camera ?? AIR_2S;
   const proj = makeProjection(centroid(input.polygon));
   const ring = input.polygon.map((p) => proj.toLocal(p));
   const home = proj.toLocal(input.home);
   const angleDeg = input.gridAngleDeg === 'auto' ? longestEdgeAngle(ring) : input.gridAngleDeg;
+  const areaHa = ringArea(ring) / 10000;
+  if (areaHa < 0.01) throw new PlanError('The area is too small or its corners are in a line.');
+  if (areaHa > MAX_AREA_HA) throw new PlanError(`The area is ${areaHa.toFixed(0)} ha. DroneCraft plans up to ${MAX_AREA_HA} ha at a time; split it into smaller areas.`);
 
   // Surfaces in absolute metres. Without terrain, ground is flat at 0 and takeoff is at 0.
   const ground = (xy: XY): number => {
@@ -137,49 +199,90 @@ function build(input: PlanInput, terrain: Terrain | null): Plan {
     input.trigger === 'time' ? overlapForSpacing(camera, input.altitudeM, ps * 1.2) : input.frontOverlap;
 
   const profile = (l: Line) => profileLine(l, target, TERRAIN_TOL_M, TERRAIN_STEP_M);
-  const lines = generateLines(ring, ls, angleDeg, input.bufferM).map((l) => ({ ...l, wps: profile(l) }));
-  const maxAlt = Math.max(input.altitudeM + input.canopyM, ...lines.flatMap((l) => l.wps!.map((w) => w.alt)));
+  const rawLines = generateLines(ring, ls, angleDeg, input.bufferM);
+  if (rawLines.length > MAX_LINES) throw new PlanError(`This needs ${rawLines.length} flight lines. Reduce the area or raise the altitude.`);
+  const lines = rawLines.map((l) => ({ ...l, wps: profile(l) }));
   const flight: FlightSettings = {
     ...DEFAULT_FLIGHT,
-    altitudeM: maxAlt,
     speedMs: input.speedMs,
     batteryMin: input.batteryMin,
     reservePct: input.reservePct,
   };
-  const extraWp = terrain ? 1 : 0; // climb above takeoff before heading out
+  const need = (xy: XY) => surface(xy) + input.minClearanceM - homeElev;
+
+  /** Climb straight up over takeoff high enough that the leg out clears the trees and needs at most 3 m/s vertical. */
+  const climbAltFor = (oriented: Line[]) => {
+    const l0 = oriented[0];
+    const firstXY = at(l0, l0.wps![0].t);
+    const firstAlt = l0.wps![0].alt;
+    const h = dist(home, firstXY);
+    const clear = maxAlong(home, firstXY, need, TERRAIN_STEP_M);
+    return Math.max(clear, firstAlt - (CLIMB_OUT_VERTICAL_MS / flight.transitSpeedMs) * h);
+  };
+  const itineraryFor = (oriented: Line[]) => {
+    const withWps = oriented.map((l) => (l.wps ? l : { ...l, wps: profile(l) }));
+    const climbAltM = climbAltFor(withWps);
+    return {
+      lines: withWps,
+      climbAltM,
+      wps: buildItinerary(withWps, home, { speedMs: input.speedMs, transitSpeedMs: flight.transitSpeedMs, climbAltM }),
+    };
+  };
+  const timing = { climbMs: flight.climbMs, descentMs: flight.descentMs, perWaypointS: flight.turnOverheadS, returnSpeedMs: RETURN_SPEED_MS };
   const missions = splitMissions(lines, home, flight, {
-    wpCount: (l) => (l.wps ?? profile(l)).length,
-    extraWp,
+    measure: (oriented) => {
+      const it = itineraryFor(oriented);
+      return { waypoints: it.wps.length, timeS: itineraryTime(it.wps, home, timing) };
+    },
   });
 
-  // Lines cut to fit a battery lose their profile; re-plan them. Then add the climb waypoint and measure.
   let minClear = Infinity;
   let minLineClear = Infinity;
   let maxAgl = -Infinity;
   let maxVert = 0;
   let rthNeed = -Infinity;
-  const need = (xy: XY) => surface(xy) + input.minClearanceM - homeElev;
+  let shortestLeg = Infinity;
+  let longestLeg = 0;
+  let maxAlt = -Infinity;
+  let minAlt = Infinity;
+  const toPts = (w: ItinWp[]): PathPt[] => w.map((p) => ({ xy: p.xy, alt: p.alt }));
   for (const m of missions) {
-    m.lines = m.lines.map((l) => (l.wps ? l : { ...l, wps: profile(l) }));
-    const linePts: PathPt[] = m.lines.flatMap((l) => l.wps!.map((w) => ({ xy: at(l, w.t), alt: w.alt })));
-    if (terrain) {
-      // Climb straight up at takeoff only as high as needed to clear the trees all the way to the first
-      // waypoint; the drone then rises or descends along that leg. Both ends of the leg are at or above
-      // the highest requirement on it, so the straight leg between them is too.
-      const first = linePts[0];
-      m.climbAltM = maxAlong(home, first.xy, need, TERRAIN_STEP_M);
-    }
-    const path: PathPt[] = m.climbAltM !== undefined ? [{ xy: home, alt: m.climbAltM }, ...linePts] : linePts;
-    const st = pathStats(path, surface, ground, homeElev, TERRAIN_STEP_M);
+    const it = itineraryFor(m.lines);
+    m.lines = it.lines;
+    m.climbAltM = it.climbAltM;
+    m.itinerary = it.wps;
+    m.waypointCount = it.wps.length;
+    const st = pathStats(toPts(it.wps), surface, ground, homeElev, TERRAIN_STEP_M);
     minClear = Math.min(minClear, st.minClearance);
-    minLineClear = Math.min(minLineClear, pathStats(linePts, surface, ground, homeElev, TERRAIN_STEP_M).minClearance);
+    const firstLine = it.wps.findIndex((w) => w.kind === 'line');
+    minLineClear = Math.min(minLineClear, pathStats(toPts(it.wps.slice(firstLine)), surface, ground, homeElev, TERRAIN_STEP_M).minClearance);
     maxAgl = Math.max(maxAgl, st.maxAboveGround);
-    maxVert = Math.max(maxVert, maxVerticalSpeed(linePts, input.speedMs));
-    if (terrain) {
-      // RTH can start anywhere: it must clear the ground on a straight line home from every waypoint.
-      for (const p of linePts) rthNeed = Math.max(rthNeed, p.alt, maxAlong(p.xy, home, need, 20));
+    maxVert = Math.max(maxVert, itineraryMaxVertical(it.wps));
+    const ext = legExtremes(it.wps);
+    shortestLeg = Math.min(shortestLeg, ext.shortest || Infinity);
+    longestLeg = Math.max(longestLeg, ext.longest);
+    for (const w of it.wps) {
+      maxAlt = Math.max(maxAlt, w.alt);
+      minAlt = Math.min(minAlt, w.alt);
     }
-    m.waypointCount = linePts.length + (m.climbAltM !== undefined ? 1 : 0);
+    if (terrain) {
+      // RTH can start anywhere on the path, not just at waypoints: sample every 20 m along every leg
+      // and require a straight line home from each sample to clear the trees.
+      for (let i = 0; i + 1 < it.wps.length; i++) {
+        const a = it.wps[i].xy;
+        const b = it.wps[i + 1].xy;
+        const n = Math.max(1, Math.ceil(dist(a, b) / 20));
+        for (let k = 0; k <= n; k++) {
+          const p: XY = [a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n];
+          rthNeed = Math.max(rthNeed, maxAlong(p, home, need, 20));
+        }
+      }
+    }
+  }
+  if (terrain && rthNeed > -Infinity) {
+    // Re-time each mission with the RTH climb included.
+    const rthAltM = Math.ceil(rthNeed / 5) * 5;
+    for (const m of missions) m.timeS = itineraryTime(m.itinerary!, home, { ...timing, rthAltM });
   }
 
   let terrainSummary: TerrainSummary | null = null;
@@ -207,6 +310,8 @@ function build(input: PlanInput, terrain: Terrain | null): Plan {
   if (!missions.length) {
     minClear = minLineClear = input.altitudeM;
     maxAgl = input.altitudeM + input.canopyM;
+    maxAlt = minAlt = 0;
+    shortestLeg = LITCHI_MIN_LEG_M;
   }
 
   const checks = runChecks({
@@ -222,6 +327,12 @@ function build(input: PlanInput, terrain: Terrain | null): Plan {
     maxAgl: Math.round(maxAgl * 10) / 10,
     maxVert,
     terrain: terrainSummary,
+    terrainStatus: terrain ? 'loaded' : missing,
+    shortestLeg,
+    longestLeg,
+    maxAlt,
+    minAlt,
+    photoSpacing: ps,
   });
 
   return {
@@ -241,7 +352,7 @@ function build(input: PlanInput, terrain: Terrain | null): Plan {
     checks,
     exportBlocked: checks.some((c) => c.status === 'fail'),
     terrain: terrainSummary,
-    terrainStatus: terrain ? 'loaded' : 'none',
+    terrainStatus: terrain ? 'loaded' : missing,
     minClearanceM: minClear,
     minLineClearanceM: minLineClear,
     maxAboveGroundM: maxAgl,
@@ -297,6 +408,12 @@ export function runChecks(a: {
   maxAgl: number;
   maxVert: number;
   terrain: TerrainSummary | null;
+  terrainStatus: 'loaded' | 'none' | 'incomplete';
+  shortestLeg: number;
+  longestLeg: number;
+  maxAlt: number;
+  minAlt: number;
+  photoSpacing: number;
 }): Check[] {
   const { input, camera, missions, interval, worst, budget } = a;
   const out: Check[] = [];
@@ -352,20 +469,40 @@ export function runChecks(a: {
       : `${fmt(a.minClear)} m above the trees, assuming flat ground at takeoff height and ${input.canopyM} m trees.`,
   });
 
+  out.push({
+    id: 'climb',
+    label: 'Climb and descent rate',
+    status: a.maxVert > 4 ? 'fail' : a.maxVert > 3 ? 'caution' : 'pass',
+    detail: `Steepest leg, including the climb-out from takeoff, needs ${Number.isFinite(a.maxVert) ? a.maxVert.toFixed(1) : 'an unlimited'} m/s vertical at its planned speed. Above 3 m/s the drone may not hold the profile; fly slower or lay lines along the contours.`,
+  });
   if (a.terrain) {
-    out.push({
-      id: 'climb',
-      label: 'Climb and descent rate',
-      status: a.maxVert > 4 ? 'fail' : a.maxVert > 3 ? 'caution' : 'pass',
-      detail: `Steepest leg needs ${a.maxVert.toFixed(1)} m/s vertical at ${input.speedMs} m/s. Above 3 m/s the drone may not hold the profile; fly slower or lay lines along the contours.`,
-    });
     out.push({
       id: 'rth',
       label: 'Return-to-home altitude',
-      status: 'pass',
-      detail: `Set RTH altitude in DJI Fly to at least ${a.terrain.rthAltM} m. That clears the treetops by ${input.minClearanceM} m on a straight line home from any waypoint.`,
+      status: a.terrain.rthAltM > input.maxAltitudeM ? 'caution' : 'pass',
+      detail: `Set RTH altitude in DJI Fly to at least ${a.terrain.rthAltM} m. That clears the treetops by ${input.minClearanceM} m on a straight line home from any point on the path, checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
     });
   }
+
+  out.push({
+    id: 'litchi',
+    label: 'Litchi limits',
+    status:
+      a.longestLeg > LITCHI_MAX_LEG_M ||
+      a.shortestLeg < LITCHI_MIN_LEG_M ||
+      a.maxAlt > LITCHI_MAX_ALT_M ||
+      a.photoSpacing > LITCHI_MAX_INTERVAL ||
+      (input.trigger === 'time' && interval > LITCHI_MAX_INTERVAL)
+        ? 'fail'
+        : a.minAlt < 0
+          ? 'caution'
+          : 'pass',
+    detail:
+      `Legs ${a.shortestLeg.toFixed(1)} to ${a.longestLeg.toFixed(0)} m (Litchi accepts ${LITCHI_MIN_LEG_M} to ${LITCHI_MAX_LEG_M} m). ` +
+      `Altitudes ${a.minAlt.toFixed(0)} to ${a.maxAlt.toFixed(0)} m above takeoff (Hub import limit ${LITCHI_MAX_ALT_M} m). ` +
+      `Photo interval ${input.trigger === 'time' ? `${interval.toFixed(1)} s` : `${a.photoSpacing.toFixed(1)} m`} (limit ${LITCHI_MAX_INTERVAL}).` +
+      (a.minAlt < 0 ? ' Some waypoints are below takeoff height; confirm Litchi Hub accepts them after import.' : ''),
+  });
 
   if (input.trigger === 'time') {
     const pct = worst * 100;
@@ -399,10 +536,13 @@ export function runChecks(a: {
   out.push({
     id: 'terrain',
     label: 'Terrain data',
-    status: a.terrain ? 'pass' : 'caution',
+    status: a.terrain ? 'pass' : input.flatGroundConfirmed ? 'caution' : 'fail',
     detail: a.terrain
       ? `${a.terrain.source}. Ground under the lines ${fmt(a.terrain.minGroundM)} to ${fmt(a.terrain.maxGroundM)} m, takeoff ${fmt(a.terrain.homeElevM)} m. Altitudes follow the terrain.`
-      : 'No elevation data. Altitude is constant above takeoff, so on sloped ground the drone will be closer to the trees uphill. Only fly this on flat sites.',
+      : (a.terrainStatus === 'incomplete' ? 'Elevation data does not cover the whole plan. ' : 'No elevation data. ') +
+        (input.flatGroundConfirmed
+          ? 'You confirmed the site is flat, so altitudes are constant above takeoff.'
+          : 'Export is blocked until elevation loads, or you confirm the site is flat. On a slope the drone would be closer to the trees uphill.'),
   });
 
   out.push({
@@ -418,4 +558,14 @@ export function runChecks(a: {
     out.push({ id: 'empty', label: 'Coverage', status: 'fail', detail: 'No flight lines. Draw a larger area.' });
   }
   return out;
+}
+
+function ringArea(ring: XY[]): number {
+  let a = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[(i + 1) % ring.length];
+    a += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(a) / 2;
 }

@@ -23,13 +23,16 @@ export function toKml(plan: Plan, name: string): string {
   const placemarks = plan.missions
     .map((m, i) => {
       const pts: string[] = [];
-      if (m.climbAltM !== undefined) pts.push(c(input.home, m.climbAltM));
-      for (const l of m.lines) {
-        const wps = l.wps ?? [
-          { t: 0, alt: input.altitudeM },
-          { t: 1, alt: input.altitudeM },
-        ];
-        for (const w of wps) pts.push(c(proj.toLngLat(at(l, w.t)), w.alt));
+      if (m.itinerary) {
+        for (const w of m.itinerary) pts.push(c(proj.toLngLat(w.xy), w.alt));
+      } else {
+        for (const l of m.lines) {
+          const wps = l.wps ?? [
+            { t: 0, alt: input.altitudeM },
+            { t: 1, alt: input.altitudeM },
+          ];
+          for (const w of wps) pts.push(c(proj.toLngLat(at(l, w.t)), w.alt));
+        }
       }
       return `<Placemark><name>Mission ${m.index}</name><styleUrl>#m${i % COLORS.length}</styleUrl><LineString><altitudeMode>${mode}</altitudeMode><coordinates>${pts.join(' ')}</coordinates></LineString></Placemark>`;
     })
@@ -42,11 +45,20 @@ ${placemarks}</Document></kml>
 `;
 }
 
-/** Parse the first polygon from a KML string. Works without a DOM. */
+/**
+ * Outer ring of the first Polygon in a KML string (Polygon > outerBoundaryIs > LinearRing > coordinates),
+ * ignoring Points and LineStrings. Handles namespace prefixes. Works without a DOM.
+ */
 export function polygonFromKml(kml: string): [number, number][] | null {
-  const m = kml.match(/<coordinates>([\s\S]*?)<\/coordinates>/i);
-  if (!m) return null;
-  const pts = m[1]
+  const tag = (name: string) => `<(?:[\\w.-]+:)?${name}\\b[^>]*>`;
+  const close = (name: string) => `</(?:[\\w.-]+:)?${name}\\s*>`;
+  const poly = new RegExp(`${tag('Polygon')}([\\s\\S]*?)${close('Polygon')}`, 'i').exec(kml);
+  if (!poly) return null;
+  const outer = new RegExp(`${tag('outerBoundaryIs')}([\\s\\S]*?)${close('outerBoundaryIs')}`, 'i').exec(poly[1]);
+  if (!outer) return null;
+  const coords = new RegExp(`${tag('coordinates')}([\\s\\S]*?)${close('coordinates')}`, 'i').exec(outer[1]);
+  if (!coords) return null;
+  const pts = coords[1]
     .trim()
     .split(/\s+/)
     .map((t) => t.split(',').map(Number))

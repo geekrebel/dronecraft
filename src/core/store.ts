@@ -42,11 +42,16 @@ export class PlanStore<S> {
     this.data = d && d.plans ? d : { current: null, plans: {} };
   }
 
+  /** False after a write failed (storage full or blocked); true again after the next successful write. */
+  saved = true;
+
   private persist() {
     try {
       this.kv.setItem(STORE_KEY, JSON.stringify(this.data));
+      this.saved = true;
     } catch {
-      /* storage full or blocked: keep working in memory */
+      // Keep working in memory, but let the app tell the user their changes are not stored.
+      this.saved = false;
     }
   }
 

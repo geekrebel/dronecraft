@@ -6,11 +6,11 @@ maplibregl.setWorkerUrl(maplibreWorkerUrl);
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './style.css';
 import { registerSW } from 'virtual:pwa-register';
-import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
+import { DEFAULT_INPUT, Plan, PlanError, PlanInput, buildPlan } from './core/plan';
 import { LngLat, centroid } from './core/projection';
 import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './core/shapes';
 import { KV, PlanDoc, PlanStore, uniqueName } from './core/store';
-import { parsePlansFile, serializePlans } from './core/planfile';
+import { areaProblem, parsePlansFile, serializePlans } from './core/planfile';
 import { TERRAIN_ZOOM, Terrain, TileTerrain, tilesFor } from './core/terrain';
 import { hasTiles, loadTiles, loadedTiles } from './terrainLoader';
 import { makeProjection } from './core/projection';
@@ -123,12 +123,26 @@ function terrainPoints(): LngLat[] {
   return [p.toLngLat([x0, y0]), p.toLngLat([x1, y1]), p.toLngLat([x0, y1]), p.toLngLat([x1, y0])];
 }
 
+/** Tile set that last failed to load, so edits elsewhere don't re-trigger it in a loop. */
+let failedKeys: string | null = null;
+let retryCount = 0;
+const RETRY_DELAYS_S = [5, 20, 60];
+const keysId = () => tilesFor(terrainPoints(), TERRAIN_ZOOM).map((k) => `${k.z}/${k.x}/${k.y}`).join(',');
+
+/** Retry from scratch: used by the Retry button and when the connection comes back. */
+function retryTerrain() {
+  failedKeys = null;
+  retryCount = 0;
+  ensureTerrain(true);
+}
+
 /** Make sure elevation tiles for the current area are loaded; re-plan when they arrive. */
 function ensureTerrain(now = false) {
   clearTimeout(terrainTimer);
   const run = async () => {
     const keys = tilesFor(terrainPoints(), TERRAIN_ZOOM);
     if (!keys.length) return;
+    const id = keysId();
     if (hasTiles(keys)) {
       if (terrainState !== 'ready' || !terrain) {
         terrain = new TileTerrain(loadedTiles(), TERRAIN_ZOOM);
@@ -144,9 +158,22 @@ function ensureTerrain(now = false) {
       terrain = new TileTerrain(loadedTiles(), TERRAIN_ZOOM);
       terrainState = 'ready';
       terrainError = '';
+      failedKeys = null;
+      retryCount = 0;
     } catch (e) {
       terrainState = 'error';
-      terrainError = navigator.onLine === false ? 'You are offline and this area has not been loaded before.' : (e as Error).message;
+      failedKeys = id;
+      const offline = navigator.onLine === false;
+      terrainError = offline ? 'You are offline and this area has not been loaded before.' : (e as Error).message;
+      // Transient failures get a few spaced retries; offline waits for the 'online' event or the Retry button.
+      if (!offline && retryCount < RETRY_DELAYS_S.length) {
+        const delay = RETRY_DELAYS_S[retryCount++] * 1000;
+        clearTimeout(terrainTimer);
+        terrainTimer = setTimeout(() => {
+          failedKeys = null;
+          ensureTerrain(true);
+        }, delay);
+      }
     }
     update();
   };
@@ -154,8 +181,17 @@ function ensureTerrain(now = false) {
   else terrainTimer = setTimeout(run, 500);
 }
 
+let planError = '';
 function recompute() {
-  plan = state.polygon.length >= 3 && state.home ? buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }, terrain) : null;
+  planError = '';
+  plan = null;
+  if (state.polygon.length < 3 || !state.home) return;
+  try {
+    plan = buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }, terrain);
+  } catch (e) {
+    planError = e instanceof PlanError ? e.message : `Planning failed: ${(e as Error).message}`;
+    console.error('[dronecraft] planning failed', e);
+  }
 }
 
 // ---------- Map ----------
@@ -475,7 +511,11 @@ function refreshMap() {
 function previewPlan(): Plan | null {
   if (state.polygon.length < 3) return null;
   const c = state.polygon.reduce<LngLat>((a, p) => [a[0] + p[0] / state.polygon.length, a[1] + p[1] / state.polygon.length], [0, 0]);
-  return buildPlan({ ...state.settings, polygon: state.polygon, home: c }, terrain);
+  try {
+    return buildPlan({ ...state.settings, polygon: state.polygon, home: c }, terrain);
+  } catch {
+    return null;
+  }
 }
 
 function fitArea() {
@@ -528,9 +568,11 @@ function renderSteps() {
 
 function renderStats() {
   if (!plan) {
-    $stats.textContent = state.polygon.length < 3 ? 'Draw an area to start' : 'Set a takeoff point';
+    $stats.textContent = planError ? `Cannot plan: ${planError}` : state.polygon.length < 3 ? 'Draw an area to start' : 'Set a takeoff point';
+    $stats.classList.toggle('error', !!planError);
     return;
   }
+  $stats.classList.remove('error');
   const batt = plan.missions.length;
   $stats.textContent = `${plan.gsdCm.toFixed(1)} cm/px · ${plan.photoCount} photos · ${mmss(plan.totalTimeS)} · ${batt} ${batt === 1 ? 'battery' : 'batteries'}`;
 }
@@ -643,7 +685,9 @@ function renderStep() {
 
     case 3: {
       if (!plan) {
-        $body.innerHTML = `<p class="hint">Draw an area and set a takeoff point first.</p>`;
+        $body.innerHTML = planError
+          ? `<div class="banner fail">This plan cannot be built: ${esc(planError)}</div>`
+          : `<p class="hint">Draw an area and set a takeoff point first.</p>`;
         break;
       }
       const p = plan;
@@ -673,21 +717,33 @@ function renderStep() {
         </dl>
         <h2>Checks</h2>
         ${p.checks.map((c) => `<div class="check"><div class="dot ${c.status}"></div><b>${esc(c.label)}</b><span>${esc(c.detail)}</span></div>`).join('')}
+        ${
+          p.terrain
+            ? ''
+            : `<label class="checkbox"><input type="checkbox" id="flat" ${state.settings.flatGroundConfirmed ? 'checked' : ''}>
+          <span>This site is flat. Plan without elevation data, with altitudes constant above takeoff.</span></label>`
+        }
         <label class="checkbox"><input type="checkbox" id="geo" ${state.settings.geoZoneChecked ? 'checked' : ''}>
           <span>I have checked this area on the <a href="https://www.dji.com/flysafe/geo-map" target="_blank" rel="noopener">DJI FlySafe GEO map</a> and have any unlock I need.</span></label>
         <div class="row"><button class="btn primary" id="next" ${p.exportBlocked ? 'disabled' : ''}>Next: export</button></div>`;
+      ($body.querySelector('#flat') as HTMLInputElement | null)?.addEventListener('change', (e) => {
+        state.settings.flatGroundConfirmed = (e.target as HTMLInputElement).checked;
+        update();
+      });
       ($body.querySelector('#geo') as HTMLInputElement).addEventListener('change', (e) => {
         state.settings.geoZoneChecked = (e.target as HTMLInputElement).checked;
         update();
       });
       on('next', () => goto(4));
-      on('retryterrain', () => ensureTerrain(true));
+      on('retryterrain', retryTerrain);
       break;
     }
 
     case 4: {
       if (!plan) {
-        $body.innerHTML = `<p class="hint">Draw an area and set a takeoff point first.</p>`;
+        $body.innerHTML = planError
+          ? `<div class="banner fail">This plan cannot be built: ${esc(planError)}</div>`
+          : `<p class="hint">Draw an area and set a takeoff point first.</p>`;
         break;
       }
       const p = plan;
@@ -696,6 +752,15 @@ function renderStep() {
         <h2>Export</h2>
         ${blocked ? `<div class="banner fail">Fix the red items in Review before exporting.</div>` : ''}
         <p class="hint">Fly the missions in order, one battery each. Import each CSV in Litchi Mission Hub (Missions → Import), save it, and check it appears on your phone while you still have a connection.</p>
+        <div class="banner caution"><b>Set these in Litchi for every mission</b> (the CSV cannot carry them):
+          <ul>
+            <li>Finish action: <b>Go Home</b> (RTH)</li>
+            <li>Path mode: <b>Straight lines</b>. Curved turns ignores waypoint actions.</li>
+            <li>Heading mode: <b>Toward next waypoint</b> (Auto)</li>
+            <li>Mission photo interval, time and distance: <b>off</b>. Waypoints without photos are written as "use mission setting", so a mission interval would add photos on turns and transit.</li>
+            <li>Keep altitudes relative to takeoff; do not switch on "Above ground".</li>
+            ${p.terrain ? `<li>In DJI Fly, set RTH altitude to at least <b>${p.terrain.rthAltM} m</b>.</li>` : ''}
+          </ul></div>
         ${p.missions
           .map(
             (m, i) => `
@@ -773,8 +838,11 @@ document.getElementById('plans-btn')!.addEventListener('click', () => {
   render();
 });
 
+const $saveWarn = document.getElementById('savewarn')!;
+
 function render() {
   $planName.textContent = state.name || 'Untitled';
+  $saveWarn.hidden = store.saved;
   $steps.style.display = state.view === 'plans' ? 'none' : '';
   renderStats();
   if (state.view === 'plans') {
@@ -844,7 +912,7 @@ function renderPlans() {
           </div></div>`;
       })
       .join('')}`;
-  on('newplan', newPlan);
+  on('newplan', () => newPlan());
   on('exportall', () => {
     save();
     exportPlans(store.list(), `dronecraft-plans-${new Date().toISOString().slice(0, 10)}`);
@@ -883,7 +951,7 @@ function renderPlans() {
       if (wasCurrent) {
         const next = store.current();
         if (next) openPlan(next.id, true, false);
-        else newPlan();
+        else newPlan(false);
         return;
       }
       renderPlans();
@@ -902,8 +970,9 @@ function openPlan(id: string, stayInList = false, saveCurrent = true) {
   fitArea();
 }
 
-function newPlan() {
-  save();
+/** `saveCurrent` is false when the current plan was just deleted, so it is not written back. */
+function newPlan(saveCurrent = true) {
+  if (saveCurrent && store.get(state.id)) save();
   const doc = store.create({
     name: uniqueName('Plan', store.list().map((p) => p.name)),
     polygon: [],
@@ -924,7 +993,16 @@ function update() {
   refreshMarkers();
   refreshMap();
   render();
-  if (state.polygon.length >= 3 && !hasTiles(tilesFor(terrainPoints(), TERRAIN_ZOOM)) && terrainState !== 'loading') ensureTerrain();
+  if (
+    state.polygon.length >= 3 &&
+    terrainState !== 'loading' &&
+    !hasTiles(tilesFor(terrainPoints(), TERRAIN_ZOOM)) &&
+    keysId() !== failedKeys
+  ) {
+    // A different area from the one that failed: start fresh.
+    if (terrainState === 'error') retryCount = 0;
+    ensureTerrain();
+  }
 }
 
 function terrainBanner(p: Plan): string {
@@ -962,6 +1040,8 @@ async function importFile(e: Event) {
   }
   if (!ring) return alert('No polygon found in that file.');
   if (ring.length > 1 && ring[0][0] === ring[ring.length - 1][0] && ring[0][1] === ring[ring.length - 1][1]) ring.pop();
+  const problem = areaProblem(ring);
+  if (problem) return alert(`Cannot use that boundary: ${problem}`);
   state.polygon = ring;
   if (/^Plan( \d+)?$/.test(state.name)) state.name = file.name.replace(/\.[^.]+$/, '');
   update();
@@ -1017,6 +1097,7 @@ function reportFile(): File {
     'Permits in hand (aviation authority, land owner, national park)',
     'DJI Fly updated and GEO database synced while online',
     'All missions imported in Litchi and visible on the phone offline',
+    'Litchi mission settings: finish action Go Home, path mode Straight lines, heading Toward next waypoint, mission photo interval off, altitudes relative to takeoff',
     'Camera: JPEG or RAW+JPEG, exposure locked, focus infinity, gimbal -90',
     `SD card has room for ${p.photoCount} photos (about ${((p.photoCount * 9) / 1024).toFixed(1)} GB)`,
     `${p.missions.length} batteries charged`,
@@ -1058,7 +1139,7 @@ async function shareOrDownload(files: File[], title: string) {
 
 // Retry elevation automatically when the connection comes back.
 window.addEventListener('online', () => {
-  if (terrainState === 'error') ensureTerrain(true);
+  if (terrainState === 'error') retryTerrain();
 });
 
 // Exposed for automated smoke tests.

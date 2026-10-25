@@ -134,3 +134,6 @@ input[type='text'] {
 button.btn.danger { background: #7f1d1d; border-color: #b91c1c; color: #fff; }
 .banner.pass { background: #12301e; color: #bbf7d0; }
 .banner ul { margin: 4px 0 6px; padding-left: 18px; }
+.stats.error { color: var(--fail); }
+.savewarn { margin: 0 12px 8px; }
+.banner b { font-weight: 700; }

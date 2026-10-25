@@ -63,6 +63,11 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[MVP]** Each mission starts at the end nearest home.
 - **[v1]** Takeoff-point variants: generate the full mission set for up to three alternative takeoff points in one export.
 
+### 3.5a Itinerary
+- **[MVP, done]** One exported itinerary per mission (climb over takeoff, transit at 10 m/s with photos off, mapping lines with intermediate terrain waypoints, turns) drives the battery estimate, safety checks, Litchi CSV and KML.
+- **[MVP, done]** Legs longer than 1500 m are subdivided (Litchi accepts 0.6 to 1999 m).
+- **[MVP, done]** Climb-out altitude chosen so the leg out needs at most 3 m/s vertical and clears the trees.
+
 ### 3.6 Export
 - **[MVP]** Litchi CSV per mission, full 46-column header, with:
   - altitude per waypoint (above takeoff), altitudemode 0
@@ -74,6 +79,8 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[MVP]** KML export of all missions with absolute altitudes, for review in Google Earth.
 - **[MVP]** Plan report (text/HTML): parameters, per-mission stats, all check results, pre-flight checklist.
 - **[MVP]** Download as files; Web Share API on iOS.
+- **[MVP, done]** Export screen and report list the Litchi mission settings the CSV cannot carry: finish action Go Home, path mode Straight lines, heading Toward next waypoint, mission photo interval off, altitudes relative to takeoff.
+- Note: non-photo waypoints are written with photo interval -1. Litchi's waypoint docs say a waypoint defaults to "use mission setting"; whether -1 or 0 means "off" is unverified, so the mission-level interval must be off (field test 7).
 - **[v1]** ZIP bundle of all files.
 
 ### 3.7 Checks
@@ -91,7 +98,9 @@ Each check returns pass, caution (amber, export allowed with explanation) or fai
 | Min clearance above canopy along path [v1] | < user min (default 30 m) | < 1.5x min |
 | Climb gradient [v1] | > 4 m/s vertical at planned speed | > 3 m/s |
 | Takeoff point distance to polygon | > limit | > 50% of limit |
-| Elevation data loaded for sloped site [v1] | | none loaded |
+| Elevation data loaded | none or partial, unless flat ground confirmed | flat ground confirmed |
+| Litchi limits | leg < 0.6 m or > 1999 m; altitude > 500 m; photo interval > 100 | waypoint below takeoff |
+| RTH altitude above height limit at takeoff | | yes |
 | GEO zone checked | | not ticked |
 
 ### 3.8 Guidance and UX
@@ -195,6 +204,7 @@ Terrain [v1]
 3. DJI Assistant 2 simulator with the Air 2S connected by USB, props off: fly one mission in Litchi, confirm photos are triggered and the path matches.
 4. Home test flight on a small flat block: confirm distance-interval triggering works on the Air 2S under virtual stick, count photos vs plan, process in WebODM.
 5. Test the Litchi "start from waypoint" option after deliberately stopping a mission mid-line.
+7. Import a CSV in Litchi Hub with a mission photo interval set, and check whether waypoints written with -1 inherit it. Repeat with 0 to see whether 0 means off or "as fast as possible".
 6. Install as PWA on iPhone, enable airplane mode, open app, view plan and report.
 
 ## 7. Open questions to verify

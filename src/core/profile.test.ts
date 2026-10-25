@@ -104,10 +104,15 @@ describe('buildPlan with terrain', () => {
     for (const m of p.missions) {
       // At least tree height + minimum clearance over the takeoff point, and the leg out keeps that clearance.
       expect(m.climbAltM!).toBeGreaterThanOrEqual(30 + 30 - 1e-6);
+      expect(m.itinerary![0].kind).toBe('climb');
     }
     expect(p.minClearanceM).toBeGreaterThanOrEqual(30 - 1e-6);
     expect(p.terrain!.rthAltM % 5).toBe(0);
-    expect(p.terrain!.rthAltM).toBeGreaterThanOrEqual(Math.max(...p.missions.flatMap((m) => m.lines.flatMap((l) => l.wps!.map((w) => w.alt)))));
+    // RTH must clear trees + minimum clearance over the highest ground the path reaches, but needs no more
+    // than the mapping altitude there (minimum clearance is below the mapping height above trees).
+    const wpAlts = p.missions.flatMap((m) => m.itinerary!.filter((w) => w.kind !== 'climb').map((w) => w.alt));
+    expect(p.terrain!.rthAltM).toBeGreaterThanOrEqual(Math.max(...wpAlts) - 80 + 30);
+    expect(p.terrain!.rthAltM).toBeLessThanOrEqual(Math.max(...wpAlts) + 5);
   });
 
   it('CSV carries the climb waypoint and per-waypoint altitudes; photos stop at each line end', () => {
@@ -123,10 +128,8 @@ describe('buildPlan with terrain', () => {
     expect(wps[0].photoDist).toBe(-1);
     const alts = new Set(wps.slice(1).map((w) => Math.round(w.alt)));
     expect(alts.size).toBeGreaterThan(1); // altitude varies with the slope
-    let i = 1;
-    for (const l of m.lines) {
-      for (let k = 0; k < l.wps!.length; k++, i++) expect(wps[i].photoDist > 0).toBe(k < l.wps!.length - 1);
-    }
+    m.itinerary!.forEach((w, i) => expect(wps[i].photoDist > 0).toBe(w.photo));
+    expect(m.itinerary!.filter((w) => w.kind === 'lineEnd').every((w) => !w.photo)).toBe(true);
   });
 
   it('steep terrain trips the climb-rate check', () => {
@@ -144,8 +147,8 @@ describe('buildPlan with terrain', () => {
   });
 
   it('without terrain, altitude above takeoff is height above trees + tree height', () => {
-    const p = buildPlan(input);
+    const p = buildPlan({ ...input, flatGroundConfirmed: true });
     for (const m of p.missions) for (const l of m.lines) for (const w of l.wps!) expect(w.alt).toBe(110);
-    expect(p.missions.every((m) => m.climbAltM === undefined)).toBe(true);
+    expect(p.missions.every((m) => m.itinerary![0].kind === 'climb')).toBe(true);
   });
 });

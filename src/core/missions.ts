@@ -1,3 +1,4 @@
+import type { ItinWp } from './itinerary';
 import { Line, lineLength } from './grid';
 import { XY, dist } from './projection';
 
@@ -35,14 +36,21 @@ export interface Mission {
   maxDistFromHomeM: number;
   /** True if a single flight line had to be cut to fit the battery. */
   splitLine: boolean;
-  /** Altitude of a first waypoint straight above takeoff, when terrain requires climbing before leaving. */
+  /** Altitude of the first waypoint straight above takeoff. */
   climbAltM?: number;
+  /** The exported flight, waypoint by waypoint. */
+  itinerary?: ItinWp[];
 }
 
 /** How many waypoints a line will produce once altitudes are planned, plus fixed extras per mission. */
 export interface WpOptions {
   wpCount?: (l: Line) => number;
   extraWp?: number;
+  /**
+   * Measure a candidate mission exactly as it will be exported (lines already oriented).
+   * When given, this replaces the simple estimate for both waypoint count and time.
+   */
+  measure?: (lines: Line[]) => { waypoints: number; timeS: number };
 }
 
 export function budgetS(f: FlightSettings): number {
@@ -117,9 +125,24 @@ function cutLine(l: Line, maxLen: number): Line[] {
  * Lines are kept whole unless a single line alone exceeds the battery budget.
  * Each mission is oriented so it starts at the end nearer home.
  */
+/** Orient a group of lines so it starts at the end nearer home. */
+export function orient(ls: Line[], home: XY): Line[] {
+  const first = ls[0].start;
+  const last = ls[ls.length - 1].end;
+  return dist(home, last) < dist(home, first) ? reverseLines(ls) : ls;
+}
+
 export function splitMissions(lines: Line[], home: XY, f: FlightSettings, o: WpOptions = {}): Mission[] {
   const budget = budgetS(f);
-  const fits = (ls: Line[]) => waypointTotal(ls, o) <= f.maxWaypoints && estimate(ls, home, f, o).timeS <= budget;
+  const measure = (ls: Line[]) => {
+    const oriented = orient(ls, home);
+    if (o.measure) return o.measure(oriented);
+    return { waypoints: waypointTotal(oriented, o), timeS: estimate(oriented, home, f, o).timeS };
+  };
+  const fits = (ls: Line[]) => {
+    const m = measure(ls);
+    return m.waypoints <= f.maxWaypoints && m.timeS <= budget;
+  };
 
   const groups: { lines: Line[]; split: boolean }[] = [];
   let cur: Line[] = [];
@@ -148,18 +171,16 @@ export function splitMissions(lines: Line[], home: XY, f: FlightSettings, o: WpO
   if (cur.length) groups.push({ lines: cur, split: false });
 
   return groups.map((g, i) => {
-    let ls = g.lines;
-    const first = ls[0].start;
-    const last = ls[ls.length - 1].end;
-    if (dist(home, last) < dist(home, first)) ls = reverseLines(ls);
+    const ls = orient(g.lines, home);
     const e = estimate(ls, home, f, o);
+    const m = o.measure ? o.measure(ls) : { waypoints: e.waypoints, timeS: e.timeS };
     return {
       index: i + 1,
       lines: ls,
-      waypointCount: e.waypoints,
+      waypointCount: m.waypoints,
       lineDistanceM: e.lineDistanceM,
       totalDistanceM: e.totalDistanceM,
-      timeS: e.timeS,
+      timeS: m.timeS,
       maxDistFromHomeM: e.maxDistFromHomeM,
       splitLine: g.split,
     };
