@@ -199,7 +199,28 @@ modeLabel.className = 'mapmode';
 document.getElementById('map')!.appendChild(modeLabel);
 
 const empty = { type: 'FeatureCollection' as const, features: [] };
-map.on('load', () => {
+let overlaysReady = false;
+/** Add overlay sources and layers once the style is ready. Runs once, whichever event comes first. */
+function setupOverlays() {
+  if (overlaysReady) return;
+  overlaysReady = true;
+  try {
+    addOverlays();
+  } catch (e) {
+    console.error('[dronecraft] overlay setup failed', e);
+  }
+  if (state.polygon.length < 3) newSquare(false);
+  else fitArea();
+  refreshMarkers();
+  refreshMap();
+  render();
+  ensureTerrain(true);
+}
+map.on('style.load', setupOverlays);
+map.on('load', setupOverlays);
+map.on('error', (e) => console.error('[dronecraft] map error', e.error?.message ?? e));
+
+function addOverlays() {
   for (const id of ['area', 'lines', 'turns', 'transit', 'arrows', 'photos']) {
     map.addSource(id, { type: 'geojson', data: empty });
   }
@@ -259,13 +280,7 @@ map.on('load', () => {
     layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: { 'line-color': '#0b120e', 'line-width': 2 },
   });
-  if (state.polygon.length < 3) newSquare(false);
-  else fitArea();
-  refreshMarkers();
-  refreshMap();
-  render();
-  ensureTerrain(true);
-});
+}
 
 // Tapping the map only sets takeoff, and only on the takeoff step. The area is edited with handles.
 map.on('click', (e) => {
@@ -1047,8 +1062,11 @@ window.addEventListener('online', () => {
 });
 
 // Exposed for automated smoke tests.
-(window as any).__dronecraft = { state, getPlan: () => plan, update, store, terrainState: () => terrainState };
+(window as any).__dronecraft = { state, getPlan: () => plan, update, store, terrainState: () => terrainState, map, overlaysReady: () => overlaysReady };
 
 recompute();
 refreshMarkers();
 render();
+// The style is inline, so it may already be ready; and elevation does not depend on the map at all.
+if (map.isStyleLoaded()) setupOverlays();
+ensureTerrain(true);
