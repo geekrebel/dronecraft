@@ -92,4 +92,12 @@ describe('plan store', () => {
     expect(uniqueName('X', [])).toBe('X');
     expect(uniqueName('X', ['X', 'X 2'])).toBe('X 3');
   });
+
+  it('create can add a plan without making it current', () => {
+    const s = new PlanStore(new MemKV(), clock());
+    const a = s.create(doc('A'));
+    s.create(doc('B'), false);
+    expect(s.currentId()).toBe(a.id);
+    expect(s.list().length).toBe(2);
+  });
 });

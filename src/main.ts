@@ -10,6 +10,7 @@ import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
 import { LngLat, centroid } from './core/projection';
 import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './core/shapes';
 import { KV, PlanDoc, PlanStore, uniqueName } from './core/store';
+import { parsePlansFile, serializePlans } from './core/planfile';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
 import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
 import { displayGeometry } from './core/display';
@@ -682,6 +683,7 @@ function goto(step: number) {
 const $planName = document.getElementById('plan-name')!;
 document.getElementById('plans-btn')!.addEventListener('click', () => {
   state.view = state.view === 'plans' ? 'steps' : 'plans';
+  importMsg = null;
   render();
 });
 
@@ -699,14 +701,47 @@ function render() {
 }
 
 let pendingDelete: string | null = null;
+let importMsg: { kind: 'pass' | 'caution' | 'fail'; html: string } | null = null;
+
+function exportPlans(plans: PlanDoc<Settings>[], base: string) {
+  const f = new File([serializePlans(plans)], `${base}.json`, { type: 'application/json' });
+  void shareOrDownload([f], plans.length === 1 ? `DroneCraft plan: ${plans[0].name}` : 'DroneCraft plans');
+}
+
+async function importPlans(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  const { plans, skipped } = parsePlansFile(await file.text(), DEFAULT_INPUT as Settings & Record<string, unknown>);
+  const taken = store.list().map((p) => p.name);
+  const added: string[] = [];
+  for (const p of plans) {
+    const name = uniqueName(p.name, taken);
+    taken.push(name);
+    store.create({ ...p, name }, false);
+    added.push(name);
+  }
+  const list = (xs: string[]) => xs.map((x) => `<li>${esc(x)}</li>`).join('');
+  importMsg = {
+    kind: added.length ? (skipped.length ? 'caution' : 'pass') : 'fail',
+    html:
+      (added.length ? `Imported ${added.length} plan${added.length === 1 ? '' : 's'}:<ul>${list(added)}</ul>` : 'Nothing imported.') +
+      (skipped.length ? `Skipped:<ul>${list(skipped)}</ul>` : ''),
+  };
+  renderPlans();
+}
 
 function renderPlans() {
   const plans = store.list();
   const fmtDate = (t: number) => new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
   $body.innerHTML = `
     <h2>Flight plans</h2>
-    <p class="hint">Plans are saved on this device as you work. Open one to edit it, or start a new one.</p>
+    <p class="hint">Plans are saved on this device as you work. Open one to edit it, or start a new one. Export to back them up or move them to another device.</p>
     <div class="row"><button class="btn primary" id="newplan">New plan</button><button class="btn" id="back">Back to ${esc(state.name || 'plan')}</button></div>
+    <div class="row"><button class="btn" id="exportall" ${plans.length ? '' : 'disabled'}>Export all plans</button>
+      <label class="btn">Import plans<input id="importplans" type="file" accept="application/json,.json" hidden></label></div>
+    ${importMsg ? `<div class="banner ${importMsg.kind}">${importMsg.html}</div>` : ''}
     ${plans
       .map((p) => {
         const ha = polygonAreaM2(p.polygon) / 10000;
@@ -718,11 +753,24 @@ function renderPlans() {
           <div class="plan-actions">
             ${isCur ? '' : `<button class="btn" data-open="${p.id}">Open</button>`}
             <button class="btn" data-dup="${p.id}">Duplicate</button>
+            <button class="btn" data-exp="${p.id}">Export</button>
             <button class="btn ${confirm ? 'danger' : ''}" data-del="${p.id}">${confirm ? 'Tap to confirm' : 'Delete'}</button>
           </div></div>`;
       })
       .join('')}`;
   on('newplan', newPlan);
+  on('exportall', () => {
+    save();
+    exportPlans(store.list(), `dronecraft-plans-${new Date().toISOString().slice(0, 10)}`);
+  });
+  ($body.querySelector('#importplans') as HTMLInputElement).addEventListener('change', importPlans);
+  $body.querySelectorAll<HTMLElement>('[data-exp]').forEach((b) =>
+    b.addEventListener('click', () => {
+      save();
+      const p = store.get(b.dataset.exp!);
+      if (p) exportPlans([p], `${slugOf(p.name)}.dronecraft`);
+    }),
+  );
   on('back', () => {
     state.view = 'steps';
     render();
@@ -824,7 +872,8 @@ async function importFile(e: Event) {
   fitArea();
 }
 
-const slug = () => (state.name || 'site').trim().replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'site';
+const slugOf = (name: string) => (name || 'plan').trim().replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'plan';
+const slug = () => slugOf(state.name);
 
 function missionFile(i: number): File {
   const p = plan!;
@@ -889,9 +938,14 @@ function downloadFile(f: File) {
 
 async function shareAll() {
   const files = [...plan!.missions.map((_, i) => missionFile(i)), kmlFile(), reportFile()];
+  await shareOrDownload(files, `DroneCraft: ${state.name}`);
+}
+
+/** Share sheet where available (iOS: Save to Files, AirDrop, Mail), otherwise plain downloads. */
+async function shareOrDownload(files: File[], title: string) {
   if (navigator.canShare?.({ files })) {
     try {
-      await navigator.share({ files, title: `DroneCraft: ${state.name}` });
+      await navigator.share({ files, title });
       return;
     } catch (err) {
       if ((err as Error).name === 'AbortError') return;

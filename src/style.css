@@ -132,3 +132,5 @@ input[type='text'] {
 .plan-actions .btn { padding: 6px 12px; font-size: 13px; }
 .tag { font-size: 11px; background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 1px 7px; margin-left: 4px; vertical-align: 1px; }
 button.btn.danger { background: #7f1d1d; border-color: #b91c1c; color: #fff; }
+.banner.pass { background: #12301e; color: #bbf7d0; }
+.banner ul { margin: 4px 0 6px; padding-left: 18px; }

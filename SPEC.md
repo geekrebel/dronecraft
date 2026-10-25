@@ -28,6 +28,7 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[MVP]** Set takeoff point by tapping the map or using the device's GPS.
 - **[MVP]** Multiple named plans saved on the device: new, open, rename, duplicate, delete (with confirm).
 - **[MVP]** Reset: new plan, new square, reset settings to defaults.
+- **[MVP]** Export one or all plans to a `.json` plan file (share sheet on iOS); import adds plans without overwriting, renames clashes, skips invalid entries with reasons, refuses newer format versions.
 - **[v2]** Exclusion zones (holes) inside the polygon.
 
 ### 3.2 Camera model

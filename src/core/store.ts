@@ -64,10 +64,10 @@ export class PlanStore<S> {
     return id ? this.data.plans[id] : undefined;
   }
 
-  create(doc: Omit<PlanDoc<S>, 'id' | 'updatedAt'>): PlanDoc<S> {
+  create(doc: Omit<PlanDoc<S>, 'id' | 'updatedAt'>, makeCurrent = true): PlanDoc<S> {
     const d: PlanDoc<S> = { ...structuredClone(doc), id: newId(this.now()), updatedAt: this.now() };
     this.data.plans[d.id] = d;
-    this.data.current = d.id;
+    if (makeCurrent) this.data.current = d.id;
     this.persist();
     return d;
   }
