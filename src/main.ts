@@ -1,0 +1,590 @@
+import * as maplibregl from 'maplibre-gl';
+import { GeoJSONSource, Map as MlMap, Marker } from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import './style.css';
+import { registerSW } from 'virtual:pwa-register';
+import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
+import { LngLat } from './core/projection';
+import { missionWaypoints, toLitchiCsv } from './core/litchi';
+import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
+
+registerSW({ immediate: true });
+
+// ---------- State ----------
+type Settings = Omit<PlanInput, 'polygon' | 'home'>;
+interface State {
+  name: string;
+  polygon: LngLat[];
+  home: LngLat | null;
+  settings: Settings;
+  step: number;
+  basemap: 'map' | 'satellite';
+}
+
+const STORE = 'dronecraft:v1';
+const BUKIT_LAWANG: LngLat = [98.12, 3.55];
+const MISSION_COLORS = ['#d9f99d', '#67e8f9', '#f9a8d4', '#fdba74', '#c4b5fd', '#86efac', '#fde047'];
+
+function load(): State {
+  const fresh: State = { name: 'site', polygon: [], home: null, settings: { ...DEFAULT_INPUT }, step: 0, basemap: 'map' };
+  try {
+    const raw = localStorage.getItem(STORE);
+    if (!raw) return fresh;
+    const s = JSON.parse(raw);
+    return { ...fresh, ...s, settings: { ...DEFAULT_INPUT, ...s.settings } };
+  } catch {
+    return fresh;
+  }
+}
+const state = load();
+function save() {
+  try {
+    localStorage.setItem(STORE, JSON.stringify(state));
+  } catch {
+    /* storage unavailable: app still works for this session */
+  }
+}
+
+let plan: Plan | null = null;
+function recompute() {
+  plan = state.polygon.length >= 3 && state.home ? buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }) : null;
+}
+
+// ---------- Map ----------
+const OSM = {
+  type: 'raster' as const,
+  tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+  tileSize: 256,
+  maxzoom: 19,
+  attribution: '© OpenStreetMap contributors',
+};
+const SAT = {
+  type: 'raster' as const,
+  tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+  tileSize: 256,
+  maxzoom: 19,
+  attribution: 'Imagery © Esri, Maxar, Earthstar Geographics',
+};
+
+const map = new MlMap({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: { osm: OSM, sat: SAT },
+    layers: [
+      { id: 'osm', type: 'raster', source: 'osm', layout: { visibility: state.basemap === 'map' ? 'visible' : 'none' } },
+      { id: 'sat', type: 'raster', source: 'sat', layout: { visibility: state.basemap === 'satellite' ? 'visible' : 'none' } },
+    ],
+  },
+  center: state.polygon[0] ?? BUKIT_LAWANG,
+  zoom: state.polygon.length ? 15 : 13,
+  attributionControl: { compact: true },
+});
+map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right');
+map.addControl(
+  new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true }, trackUserLocation: false }),
+  'top-right',
+);
+
+const modeLabel = document.createElement('div');
+modeLabel.className = 'mapmode';
+document.getElementById('map')!.appendChild(modeLabel);
+
+const empty = { type: 'FeatureCollection' as const, features: [] };
+map.on('load', () => {
+  map.addSource('area', { type: 'geojson', data: empty });
+  map.addSource('lines', { type: 'geojson', data: empty });
+  map.addSource('transit', { type: 'geojson', data: empty });
+  map.addLayer({ id: 'area-fill', type: 'fill', source: 'area', paint: { 'fill-color': '#d9f99d', 'fill-opacity': 0.12 } });
+  map.addLayer({ id: 'area-line', type: 'line', source: 'area', paint: { 'line-color': '#d9f99d', 'line-width': 2 } });
+  map.addLayer({
+    id: 'transit',
+    type: 'line',
+    source: 'transit',
+    paint: { 'line-color': ['get', 'color'], 'line-width': 1.5, 'line-dasharray': [2, 2], 'line-opacity': 0.8 },
+  });
+  map.addLayer({
+    id: 'lines',
+    type: 'line',
+    source: 'lines',
+    paint: { 'line-color': ['get', 'color'], 'line-width': 2.5 },
+  });
+  if (state.polygon.length >= 3) fitArea();
+  refreshMap();
+});
+
+map.on('click', (e) => {
+  const p: LngLat = [e.lngLat.lng, e.lngLat.lat];
+  if (state.step === 0) {
+    state.polygon.push(p);
+  } else if (state.step === 1) {
+    state.home = p;
+  } else return;
+  update();
+});
+
+let vertexMarkers: Marker[] = [];
+let homeMarker: Marker | null = null;
+
+function refreshMarkers() {
+  vertexMarkers.forEach((m) => m.remove());
+  vertexMarkers = [];
+  if (state.step === 0) {
+    state.polygon.forEach((p, i) => {
+      const el = document.createElement('div');
+      el.className = 'vertex';
+      el.title = 'Drag to move';
+      const mk = new Marker({ element: el, draggable: true }).setLngLat(p).addTo(map);
+      mk.on('drag', () => {
+        const ll = mk.getLngLat();
+        state.polygon[i] = [ll.lng, ll.lat];
+        recompute();
+        refreshMap();
+      });
+      mk.on('dragend', () => update());
+      vertexMarkers.push(mk);
+    });
+  }
+  if (state.home) {
+    if (!homeMarker) {
+      const el = document.createElement('div');
+      el.className = 'home-pin';
+      el.textContent = 'H';
+      homeMarker = new Marker({ element: el, draggable: true }).setLngLat(state.home).addTo(map);
+      homeMarker.on('dragend', () => {
+        const ll = homeMarker!.getLngLat();
+        state.home = [ll.lng, ll.lat];
+        update();
+      });
+    } else homeMarker.setLngLat(state.home);
+  } else if (homeMarker) {
+    homeMarker.remove();
+    homeMarker = null;
+  }
+}
+
+function refreshMap() {
+  if (!map.isStyleLoaded() || !map.getSource('area')) return;
+  const ring = state.polygon;
+  const areaFeature =
+    ring.length >= 3
+      ? { type: 'Feature', geometry: { type: 'Polygon', coordinates: [[...ring, ring[0]]] }, properties: {} }
+      : ring.length === 2
+        ? { type: 'Feature', geometry: { type: 'LineString', coordinates: ring }, properties: {} }
+        : null;
+  (map.getSource('area') as GeoJSONSource).setData({ type: 'FeatureCollection', features: areaFeature ? [areaFeature] : [] } as any);
+
+  const lineFeatures: any[] = [];
+  const transitFeatures: any[] = [];
+  if (plan && state.home) {
+    plan.missions.forEach((m, i) => {
+      const color = MISSION_COLORS[i % MISSION_COLORS.length];
+      const pts = m.lines.flatMap((l) => [plan!.proj.toLngLat(l.start), plan!.proj.toLngLat(l.end)]);
+      lineFeatures.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: pts }, properties: { color } });
+      transitFeatures.push(
+        { type: 'Feature', geometry: { type: 'LineString', coordinates: [state.home, pts[0]] }, properties: { color } },
+        { type: 'Feature', geometry: { type: 'LineString', coordinates: [pts[pts.length - 1], state.home] }, properties: { color } },
+      );
+    });
+  }
+  (map.getSource('lines') as GeoJSONSource).setData({ type: 'FeatureCollection', features: lineFeatures });
+  (map.getSource('transit') as GeoJSONSource).setData({ type: 'FeatureCollection', features: transitFeatures });
+}
+
+function fitArea() {
+  if (state.polygon.length < 2) return;
+  const b = new maplibregl.LngLatBounds();
+  state.polygon.forEach((p) => b.extend(p));
+  if (state.home) b.extend(state.home);
+  map.fitBounds(b, { padding: 40, maxZoom: 17, duration: 0 });
+}
+
+function setBasemap(b: State['basemap']) {
+  state.basemap = b;
+  map.setLayoutProperty('osm', 'visibility', b === 'map' ? 'visible' : 'none');
+  map.setLayoutProperty('sat', 'visibility', b === 'satellite' ? 'visible' : 'none');
+  save();
+  renderStep();
+}
+
+// ---------- Panel ----------
+const STEPS = ['Area', 'Takeoff', 'Settings', 'Review', 'Export'];
+const $steps = document.getElementById('steps')!;
+const $body = document.getElementById('step-body')!;
+const $stats = document.getElementById('stats')!;
+
+const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+
+function worstStatus(): 'pass' | 'caution' | 'fail' | null {
+  if (!plan) return null;
+  if (plan.checks.some((c) => c.status === 'fail')) return 'fail';
+  if (plan.checks.some((c) => c.status === 'caution')) return 'caution';
+  return 'pass';
+}
+
+function renderSteps() {
+  const w = worstStatus();
+  $steps.innerHTML = STEPS.map((s, i) => {
+    const dot = i === 3 && w ? `<span class="dot ${w}"></span>` : '';
+    return `<button data-step="${i}" class="${state.step === i ? 'on' : ''}">${i + 1}. ${s}${dot}</button>`;
+  }).join('');
+  $steps.querySelectorAll('button').forEach((b) =>
+    b.addEventListener('click', () => {
+      state.step = Number((b as HTMLElement).dataset.step);
+      save();
+      refreshMarkers();
+      render();
+    }),
+  );
+}
+
+function renderStats() {
+  if (!plan) {
+    $stats.textContent = state.polygon.length < 3 ? 'Draw an area to start' : 'Set a takeoff point';
+    return;
+  }
+  const batt = plan.missions.length;
+  $stats.textContent = `${plan.gsdCm.toFixed(1)} cm/px · ${plan.photoCount} photos · ${mmss(plan.totalTimeS)} · ${batt} ${batt === 1 ? 'battery' : 'batteries'}`;
+}
+
+function modeText() {
+  if (state.step === 0) return state.polygon.length < 3 ? `Tap the map to add corners (${state.polygon.length}/3+)` : 'Tap to add corners, drag to move';
+  if (state.step === 1) return 'Tap the map to set the takeoff point';
+  return '';
+}
+
+function renderStep() {
+  modeLabel.textContent = modeText();
+  modeLabel.style.display = modeLabel.textContent ? 'block' : 'none';
+  const s = state.settings;
+  switch (state.step) {
+    case 0:
+      $body.innerHTML = `
+        <h2>Mapping area</h2>
+        <p class="hint">Tap the map to place the corners of the area you want to map, in order around the edge. Drag a corner to adjust it. You can also import a boundary from a KML or GeoJSON file.</p>
+        <div class="row">
+          <button class="btn" id="undo" ${state.polygon.length ? '' : 'disabled'}>Undo corner</button>
+          <button class="btn" id="clear" ${state.polygon.length ? '' : 'disabled'}>Clear</button>
+          <label class="btn">Import KML / GeoJSON<input id="import" type="file" accept=".kml,.geojson,.json" hidden></label>
+        </div>
+        <div class="field"><div class="top"><label for="name">Site name</label></div>
+          <input id="name" type="text" value="${esc(state.name)}" maxlength="40" />
+          <div class="help">Used for file names.</div></div>
+        <div class="field"><div class="top"><label>Map</label>
+          <div class="seg"><button data-b="map" class="${state.basemap === 'map' ? 'on' : ''}">Street</button><button data-b="satellite" class="${state.basemap === 'satellite' ? 'on' : ''}">Satellite</button></div></div>
+          <div class="help">Satellite imagery needs a connection and is not stored for offline use.</div></div>
+        <div class="row"><button class="btn primary" id="next" ${state.polygon.length >= 3 ? '' : 'disabled'}>Next: takeoff</button></div>`;
+      on('undo', () => {
+        state.polygon.pop();
+        update();
+      });
+      on('clear', () => {
+        state.polygon = [];
+        update();
+      });
+      ($body.querySelector('#import') as HTMLInputElement).addEventListener('change', importFile);
+      ($body.querySelector('#name') as HTMLInputElement).addEventListener('input', (e) => {
+        state.name = (e.target as HTMLInputElement).value;
+        save();
+      });
+      $body.querySelectorAll('.seg button[data-b]').forEach((b) =>
+        b.addEventListener('click', () => setBasemap((b as HTMLElement).dataset.b as State['basemap'])),
+      );
+      on('next', () => goto(1));
+      break;
+
+    case 1:
+      $body.innerHTML = `
+        <h2>Takeoff point</h2>
+        <p class="hint">Tap the map where you will launch, or use your current position. Pick a clearing with open sky and line of sight to the far end of the area. Litchi altitudes are measured from this point, so launch where you planned.</p>
+        <div class="row">
+          <button class="btn" id="gps">Use my position</button>
+          <button class="btn" id="fit" ${state.polygon.length >= 2 ? '' : 'disabled'}>Zoom to area</button>
+        </div>
+        ${state.home ? `<p class="hint">Takeoff at ${state.home[1].toFixed(6)}, ${state.home[0].toFixed(6)}. Drag the H marker to move it.</p>` : ''}
+        <div class="row"><button class="btn primary" id="next" ${state.home ? '' : 'disabled'}>Next: settings</button></div>`;
+      on('gps', useGps);
+      on('fit', fitArea);
+      on('next', () => goto(2));
+      break;
+
+    case 2:
+      $body.innerHTML = `
+        <h2>Flight settings</h2>
+        <p class="hint">Defaults suit forest canopy. Numbers in the bar above update as you change things.</p>
+        ${slider('altitudeM', 'Altitude', 30, 120, 1, 'm', 'Height above the takeoff point. Higher means more ground per photo, fewer batteries, and more clearance over trees, but coarser detail. Over tall canopy, 80 to 100 m above the treetops is a sensible start.')}
+        ${slider('frontOverlap', 'Front overlap', 0.6, 0.9, 0.01, '%', 'How much each photo overlaps the next along a line. 80% suits forest, where leaves move and texture repeats.')}
+        ${slider('sideOverlap', 'Side overlap', 0.6, 0.9, 0.01, '%', 'How much neighbouring lines overlap. Sets line spacing exactly. 80% for forest.')}
+        ${slider('speedMs', 'Speed', 2, 12, 0.5, 'm/s', 'Ground speed on mapping lines. Slower is smoother and gives sharper photos. The Air 2S needs at least 2 s between photos, so too fast turns the interval check red.')}
+        <div class="field"><div class="top"><label>Photo trigger</label>
+          <div class="seg"><button data-trig="distance" class="${s.trigger === 'distance' ? 'on' : ''}">Distance</button><button data-trig="time" class="${s.trigger === 'time' ? 'on' : ''}">Time</button></div></div>
+          <div class="help">Distance takes a photo every ${plan ? plan.photoSpacingM.toFixed(1) : '…'} m, so overlap holds in wind. Time takes one every ${plan ? plan.photoIntervalS.toFixed(1) : '…'} s and overlap drifts with ground speed. Confirm distance triggering works on your Air 2S in a test flight.</div></div>
+        <div class="field"><div class="top"><label for="angle">Line direction</label>
+          <span><label class="checkbox" style="display:inline-flex;padding:0"><input type="checkbox" id="autoangle" ${s.gridAngleDeg === 'auto' ? 'checked' : ''}> Auto</label>
+          <input type="number" id="angle" min="0" max="179" step="1" value="${plan ? Math.round(plan.angleDeg) : 0}" ${s.gridAngleDeg === 'auto' ? 'disabled' : ''}></span></div>
+          <div class="help">Degrees from east, counter-clockwise. Auto follows the longest edge, which gives the fewest turns. In steady wind, lines across the wind give more even photo spacing.</div></div>
+        ${slider('bufferM', 'Edge buffer', 0, 50, 1, 'm', 'Extends each line past the area edge so the edges get full overlap.')}
+        <h2 style="margin-top:16px">Limits</h2>
+        ${slider('batteryMin', 'Battery flight time', 15, 31, 1, 'min', 'Usable time per battery. The Air 2S is rated 31 min in still air; 27 is realistic for mapping.')}
+        ${slider('reservePct', 'Battery reserve', 0.15, 0.4, 0.01, '%', 'Kept in hand for wind, the return leg and landing. 30% is a safe default in hills.')}
+        ${slider('maxRangeM', 'Max distance from takeoff', 200, 3000, 50, 'm', 'Virtual stick needs the link the whole time. In hills and forest, keep this short enough for line of sight.')}
+        ${slider('maxAltitudeM', 'Max altitude', 60, 500, 10, 'm', 'Legal ceiling. 120 m in Australia and Indonesia for normal operations.')}`;
+      bindSliders();
+      $body.querySelectorAll('.seg button[data-trig]').forEach((b) =>
+        b.addEventListener('click', () => {
+          state.settings.trigger = (b as HTMLElement).dataset.trig as 'distance' | 'time';
+          update();
+        }),
+      );
+      ($body.querySelector('#autoangle') as HTMLInputElement).addEventListener('change', (e) => {
+        state.settings.gridAngleDeg = (e.target as HTMLInputElement).checked ? 'auto' : Math.round(plan?.angleDeg ?? 0);
+        update();
+      });
+      ($body.querySelector('#angle') as HTMLInputElement).addEventListener('change', (e) => {
+        const v = Number((e.target as HTMLInputElement).value);
+        if (Number.isFinite(v)) {
+          state.settings.gridAngleDeg = ((v % 180) + 180) % 180;
+          update();
+        }
+      });
+      break;
+
+    case 3: {
+      if (!plan) {
+        $body.innerHTML = `<p class="hint">Draw an area and set a takeoff point first.</p>`;
+        break;
+      }
+      const p = plan;
+      $body.innerHTML = `
+        <h2>Review</h2>
+        ${p.exportBlocked ? `<div class="banner fail">Export is blocked until the red items are fixed.</div>` : ''}
+        <dl class="kv">
+          <dt>Ground resolution</dt><dd>${p.gsdCm.toFixed(2)} cm/px</dd>
+          <dt>Photo footprint</dt><dd>${p.footprint.across.toFixed(0)} × ${p.footprint.along.toFixed(0)} m</dd>
+          <dt>Line spacing</dt><dd>${p.lineSpacingM.toFixed(1)} m</dd>
+          <dt>Photo spacing</dt><dd>${p.photoSpacingM.toFixed(1)} m (${p.photoIntervalS.toFixed(1)} s)</dd>
+          <dt>Line direction</dt><dd>${p.angleDeg.toFixed(0)}°</dd>
+          <dt>Missions</dt><dd>${p.missions.length}</dd>
+          <dt>Photos (approx.)</dt><dd>${p.photoCount}</dd>
+          <dt>Total flight time</dt><dd>${mmss(p.totalTimeS)}</dd>
+          <dt>Storage (approx.)</dt><dd>${((p.photoCount * 9) / 1024).toFixed(1)} GB</dd>
+        </dl>
+        <h2>Checks</h2>
+        ${p.checks.map((c) => `<div class="check"><div class="dot ${c.status}"></div><b>${esc(c.label)}</b><span>${esc(c.detail)}</span></div>`).join('')}
+        <label class="checkbox"><input type="checkbox" id="geo" ${state.settings.geoZoneChecked ? 'checked' : ''}>
+          <span>I have checked this area on the <a href="https://www.dji.com/flysafe/geo-map" target="_blank" rel="noopener">DJI FlySafe GEO map</a> and have any unlock I need.</span></label>
+        <div class="row"><button class="btn primary" id="next" ${p.exportBlocked ? 'disabled' : ''}>Next: export</button></div>`;
+      ($body.querySelector('#geo') as HTMLInputElement).addEventListener('change', (e) => {
+        state.settings.geoZoneChecked = (e.target as HTMLInputElement).checked;
+        update();
+      });
+      on('next', () => goto(4));
+      break;
+    }
+
+    case 4: {
+      if (!plan) {
+        $body.innerHTML = `<p class="hint">Draw an area and set a takeoff point first.</p>`;
+        break;
+      }
+      const p = plan;
+      const blocked = p.exportBlocked;
+      $body.innerHTML = `
+        <h2>Export</h2>
+        ${blocked ? `<div class="banner fail">Fix the red items in Review before exporting.</div>` : ''}
+        <p class="hint">Fly the missions in order, one battery each. Import each CSV in Litchi Mission Hub (Missions → Import), save it, and check it appears on your phone while you still have a connection.</p>
+        ${p.missions
+          .map(
+            (m, i) => `
+          <div class="mission">
+            <div class="num" style="background:${MISSION_COLORS[i % MISSION_COLORS.length]}">${m.index}</div>
+            <div>${m.lines.length} lines · ${m.waypointCount} waypoints</div>
+            <button class="btn" data-dl="${i}" ${blocked ? 'disabled' : ''}>CSV</button>
+            <div class="meta">${mmss(m.timeS)} · ${(m.totalDistanceM / 1000).toFixed(2)} km · farthest ${m.maxDistFromHomeM.toFixed(0)} m${m.splitLine ? ' · line cut' : ''}</div>
+          </div>`,
+          )
+          .join('')}
+        <div class="row">
+          <button class="btn primary" id="share" ${blocked ? 'disabled' : ''}>Share all files</button>
+          <button class="btn" id="kml" ${blocked ? 'disabled' : ''}>KML for Google Earth</button>
+          <button class="btn" id="report">Plan report</button>
+        </div>
+        <p class="hint">The KML shows paths at the planned height above ground at each point, which is only right on flat terrain. Use it to eyeball the layout, not clearance.</p>`;
+      $body.querySelectorAll('button[data-dl]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const f = missionFile(Number((b as HTMLElement).dataset.dl));
+          downloadFile(f);
+        }),
+      );
+      on('share', shareAll);
+      on('kml', () => downloadFile(kmlFile()));
+      on('report', () => downloadFile(reportFile()));
+      break;
+    }
+  }
+}
+
+function slider(key: keyof Settings, label: string, min: number, max: number, step: number, unit: string, help: string) {
+  const v = state.settings[key] as number;
+  const pct = unit === '%';
+  return `<div class="field"><div class="top"><label for="s-${key}">${label}</label><span class="val" id="v-${key}">${fmtVal(v, unit)}</span></div>
+    <input type="range" id="s-${key}" data-key="${key}" data-unit="${unit}" min="${min}" max="${max}" step="${step}" value="${v}" aria-label="${label}${pct ? ' percent' : ''}">
+    <div class="help">${help}</div></div>`;
+}
+function fmtVal(v: number, unit: string) {
+  return unit === '%' ? `${Math.round(v * 100)}%` : `${Number.isInteger(v) ? v : v.toFixed(1)} ${unit}`;
+}
+function bindSliders() {
+  $body.querySelectorAll<HTMLInputElement>('input[type=range][data-key]').forEach((el) =>
+    el.addEventListener('input', () => {
+      const key = el.dataset.key as keyof Settings;
+      (state.settings as any)[key] = Number(el.value);
+      document.getElementById(`v-${key}`)!.textContent = fmtVal(Number(el.value), el.dataset.unit!);
+      recompute();
+      save();
+      refreshMap();
+      renderStats();
+      renderSteps();
+    }),
+  );
+}
+
+function on(id: string, fn: () => void) {
+  $body.querySelector(`#${id}`)?.addEventListener('click', fn);
+}
+function goto(step: number) {
+  state.step = step;
+  save();
+  refreshMarkers();
+  render();
+}
+
+function render() {
+  renderSteps();
+  renderStats();
+  renderStep();
+}
+
+function update() {
+  recompute();
+  save();
+  refreshMarkers();
+  refreshMap();
+  render();
+}
+
+// ---------- Actions ----------
+function useGps() {
+  if (!navigator.geolocation) return alert('Location is not available on this device.');
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      state.home = [pos.coords.longitude, pos.coords.latitude];
+      map.easeTo({ center: state.home, zoom: Math.max(map.getZoom(), 15) });
+      update();
+    },
+    (err) => alert(`Could not get your position: ${err.message}`),
+    { enableHighAccuracy: true, timeout: 15000 },
+  );
+}
+
+async function importFile(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  const text = await file.text();
+  let ring: LngLat[] | null = null;
+  try {
+    ring = file.name.toLowerCase().endsWith('.kml') ? polygonFromKml(text) : polygonFromGeoJson(text);
+  } catch {
+    ring = null;
+  }
+  if (!ring) return alert('No polygon found in that file.');
+  if (ring.length > 1 && ring[0][0] === ring[ring.length - 1][0] && ring[0][1] === ring[ring.length - 1][1]) ring.pop();
+  state.polygon = ring;
+  if (state.name === 'site') state.name = file.name.replace(/\.[^.]+$/, '');
+  update();
+  fitArea();
+}
+
+const slug = () => (state.name || 'site').trim().replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'site';
+
+function missionFile(i: number): File {
+  const p = plan!;
+  const m = p.missions[i];
+  const s = state.settings;
+  const csv = toLitchiCsv(
+    missionWaypoints(m, p.proj, {
+      altitudeM: s.altitudeM,
+      speedMs: s.speedMs,
+      gimbalPitch: s.gimbalPitch,
+      trigger: s.trigger,
+      photoSpacingM: p.photoSpacingM,
+      photoIntervalS: p.photoIntervalS,
+    }),
+  );
+  return new File([csv], `${slug()}-m${m.index}-of-${p.missions.length}.csv`, { type: 'text/csv' });
+}
+function kmlFile(): File {
+  return new File([toKml(plan!, state.name)], `${slug()}.kml`, { type: 'application/vnd.google-earth.kml+xml' });
+}
+function reportFile(): File {
+  const p = plan!;
+  const s = state.settings;
+  const L: string[] = [];
+  L.push(`DroneCraft plan: ${state.name}`, `Generated ${new Date().toISOString()}`, '');
+  L.push(`Takeoff: ${state.home![1].toFixed(6)}, ${state.home![0].toFixed(6)}`);
+  L.push(`Altitude above takeoff: ${s.altitudeM} m`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
+  L.push(`Speed: ${s.speedMs} m/s`, `Trigger: ${s.trigger === 'distance' ? `every ${p.photoSpacingM.toFixed(1)} m` : `every ${p.photoIntervalS.toFixed(1)} s`}`);
+  L.push(`GSD: ${p.gsdCm.toFixed(2)} cm/px`, `Line spacing: ${p.lineSpacingM.toFixed(1)} m`, `Line direction: ${p.angleDeg.toFixed(0)} deg`);
+  L.push(`Photos (approx): ${p.photoCount}`, `Total flight time: ${mmss(p.totalTimeS)}`, '');
+  L.push('MISSIONS');
+  p.missions.forEach((m) =>
+    L.push(`  ${m.index}. ${m.waypointCount} wp, ${mmss(m.timeS)}, ${(m.totalDistanceM / 1000).toFixed(2)} km, farthest ${m.maxDistFromHomeM.toFixed(0)} m${m.splitLine ? ', line cut' : ''}`),
+  );
+  L.push('', 'CHECKS');
+  p.checks.forEach((c) => L.push(`  [${c.status.toUpperCase()}] ${c.label}: ${c.detail}`));
+  L.push('', 'PRE-FLIGHT CHECKLIST');
+  [
+    'DJI FlySafe GEO zone checked, unlock obtained if needed',
+    'Permits in hand (aviation authority, land owner, national park)',
+    'DJI Fly updated and GEO database synced while online',
+    'All missions imported in Litchi and visible on the phone offline',
+    'Camera: JPEG or RAW+JPEG, exposure locked, focus infinity, gimbal -90',
+    `SD card has room for ${p.photoCount} photos (about ${((p.photoCount * 9) / 1024).toFixed(1)} GB)`,
+    `${p.missions.length} batteries charged`,
+    'Launch from the planned takeoff point, GPS locked, line of sight to the far corner',
+    'If a mission stops: note the waypoint, swap battery, restart the mission from that waypoint',
+  ].forEach((t) => L.push(`  [ ] ${t}`));
+  return new File([L.join('\n') + '\n'], `${slug()}-report.txt`, { type: 'text/plain' });
+}
+
+function downloadFile(f: File) {
+  const url = URL.createObjectURL(f);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = f.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function shareAll() {
+  const files = [...plan!.missions.map((_, i) => missionFile(i)), kmlFile(), reportFile()];
+  if (navigator.canShare?.({ files })) {
+    try {
+      await navigator.share({ files, title: `DroneCraft: ${state.name}` });
+      return;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return;
+    }
+  }
+  for (const f of files) downloadFile(f);
+}
+
+// Exposed for automated smoke tests.
+(window as any).__dronecraft = { state, getPlan: () => plan, update };
+
+recompute();
+refreshMarkers();
+render();
