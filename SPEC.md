@@ -48,11 +48,14 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[v1]** Oblique gimbal option for crosshatch passes.
 
 ### 3.4 Terrain and canopy
-- **[v1]** Load a DEM for the site bounding box. Sources: Copernicus GLO-30 (tiles from AWS Open Data), Open-Meteo elevation API, or a user-supplied GeoTIFF (for DEMNAS).
-- **[v1]** Load a canopy height raster (ETH global canopy height, user-supplied GeoTIFF) or set a fixed canopy offset.
-- **[v1]** Terrain-following altitudes: sample each line every 10 m, insert waypoints where linear interpolation deviates from the target surface by more than a tolerance (default 5 m), convert to height above takeoff.
-- **[v1]** Clearance check along the interpolated path, not just at waypoints.
-- **[v1]** Climb gradient check per segment with suggested speed reduction.
+- **[MVP, done]** Elevation from AWS Terrain Tiles (Terrarium PNG, z14; global SRTM 30 m, 5 m lidar in Australia). Loaded automatically for the area plus a 200 m margin; cached by the service worker for offline use; retried when back online.
+- **[MVP, done]** Altitude setting is height above the treetops. Tree height setting is added to ground elevation to estimate treetops.
+- **[MVP, done]** Terrain following: sample each line every 10 m, insert waypoints where straight-line interpolation deviates from the target by more than 5 m.
+- **[MVP, done]** Climb waypoint above takeoff, only as high as needed to clear the trees to the first line.
+- **[MVP, done]** Clearance checked every 10 m along every leg (lines, turns, climb-out); height above bare ground vs legal limit; vertical speed per leg; recommended RTH altitude covering a straight return from any waypoint.
+- **[v1]** User-supplied GeoTIFF DEM (DEMNAS) and canopy height raster (ETH global canopy height).
+- **[v1]** Elevation profile chart per line.
+- Note: SRTM is radar and in dense forest records a surface partway up the canopy, so ground + tree height overestimates treetops there. That errs on the safe side.
 
 ### 3.5 Mission splitting
 - **[MVP]** Split into missions of at most 99 waypoints.

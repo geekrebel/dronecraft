@@ -28,6 +28,16 @@ export default defineConfig({
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         runtimeCaching: [
           {
+            // Elevation tiles: cached so terrain-following plans work offline once an area has been loaded.
+            urlPattern: /^https:\/\/s3\.amazonaws\.com\/elevation-tiles-prod\//,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'elevation-tiles',
+              expiration: { maxEntries: 3000, maxAgeSeconds: 60 * 60 * 24 * 365 },
+              cacheableResponse: { statuses: [200] },
+            },
+          },
+          {
             // OSM tiles: keep a small cache of what you've viewed. Satellite tiles are not cached (licence).
             urlPattern: /^https:\/\/tile\.openstreetmap\.org\//,
             handler: 'CacheFirst',

@@ -3,6 +3,8 @@ import { XY, closedRingOpen, dist } from './projection';
 export interface Line {
   start: XY;
   end: XY;
+  /** Planned waypoints along the line (t 0..1, altitude above takeoff). Set once altitudes are planned. */
+  wps?: { t: number; alt: number }[];
 }
 
 const DEG = Math.PI / 180;

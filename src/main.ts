@@ -11,6 +11,9 @@ import { LngLat, centroid } from './core/projection';
 import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './core/shapes';
 import { KV, PlanDoc, PlanStore, uniqueName } from './core/store';
 import { parsePlansFile, serializePlans } from './core/planfile';
+import { TERRAIN_ZOOM, Terrain, TileTerrain, tilesFor } from './core/terrain';
+import { hasTiles, loadTiles, loadedTiles } from './terrainLoader';
+import { makeProjection } from './core/projection';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
 import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
 import { displayGeometry } from './core/display';
@@ -101,8 +104,58 @@ function applyDoc(doc: PlanDoc<Settings>) {
 }
 
 let plan: Plan | null = null;
+// ---------- Terrain ----------
+let terrain: Terrain | null = null;
+let terrainState: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
+let terrainError = '';
+let terrainTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Points whose surroundings need elevation: the area, takeoff, and a margin for edge buffers and turns. */
+function terrainPoints(): LngLat[] {
+  if (state.polygon.length < 3) return [];
+  const pts = [...state.polygon, ...(state.home ? [state.home] : [])];
+  const p = makeProjection(pts[0]);
+  const local = pts.map((q) => p.toLocal(q));
+  const m = 200 + state.settings.bufferM;
+  const xs = local.map((q) => q[0]);
+  const ys = local.map((q) => q[1]);
+  const [x0, x1, y0, y1] = [Math.min(...xs) - m, Math.max(...xs) + m, Math.min(...ys) - m, Math.max(...ys) + m];
+  return [p.toLngLat([x0, y0]), p.toLngLat([x1, y1]), p.toLngLat([x0, y1]), p.toLngLat([x1, y0])];
+}
+
+/** Make sure elevation tiles for the current area are loaded; re-plan when they arrive. */
+function ensureTerrain(now = false) {
+  clearTimeout(terrainTimer);
+  const run = async () => {
+    const keys = tilesFor(terrainPoints(), TERRAIN_ZOOM);
+    if (!keys.length) return;
+    if (hasTiles(keys)) {
+      if (terrainState !== 'ready' || !terrain) {
+        terrain = new TileTerrain(loadedTiles(), TERRAIN_ZOOM);
+        terrainState = 'ready';
+        update();
+      }
+      return;
+    }
+    terrainState = 'loading';
+    render();
+    try {
+      await loadTiles(keys);
+      terrain = new TileTerrain(loadedTiles(), TERRAIN_ZOOM);
+      terrainState = 'ready';
+      terrainError = '';
+    } catch (e) {
+      terrainState = 'error';
+      terrainError = navigator.onLine === false ? 'You are offline and this area has not been loaded before.' : (e as Error).message;
+    }
+    update();
+  };
+  if (now) void run();
+  else terrainTimer = setTimeout(run, 500);
+}
+
 function recompute() {
-  plan = state.polygon.length >= 3 && state.home ? buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }) : null;
+  plan = state.polygon.length >= 3 && state.home ? buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }, terrain) : null;
 }
 
 // ---------- Map ----------
@@ -133,7 +186,7 @@ const map = new MlMap({
   },
   center: state.polygon[0] ?? BUKIT_LAWANG,
   zoom: 16,
-  attributionControl: { compact: true },
+  attributionControl: { compact: true, customAttribution: 'Elevation: Mapzen terrain tiles, SRTM courtesy of the U.S. Geological Survey' },
 });
 map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right');
 map.addControl(
@@ -211,6 +264,7 @@ map.on('load', () => {
   refreshMarkers();
   refreshMap();
   render();
+  ensureTerrain(true);
 });
 
 // Tapping the map only sets takeoff, and only on the takeoff step. The area is edited with handles.
@@ -406,7 +460,7 @@ function refreshMap() {
 function previewPlan(): Plan | null {
   if (state.polygon.length < 3) return null;
   const c = state.polygon.reduce<LngLat>((a, p) => [a[0] + p[0] / state.polygon.length, a[1] + p[1] / state.polygon.length], [0, 0]);
-  return buildPlan({ ...state.settings, polygon: state.polygon, home: c });
+  return buildPlan({ ...state.settings, polygon: state.polygon, home: c }, terrain);
 }
 
 function fitArea() {
@@ -527,7 +581,9 @@ function renderStep() {
       $body.innerHTML = `
         <h2>Flight settings</h2>
         <p class="hint">Defaults suit forest canopy. Numbers in the bar above update as you change things.</p>
-        ${slider('altitudeM', 'Altitude', 30, 120, 1, 'm', 'Height above the takeoff point. Higher means more ground per photo, fewer batteries, and more clearance over trees, but coarser detail. Over tall canopy, 80 to 100 m above the treetops is a sensible start.')}
+        ${slider('altitudeM', 'Height above trees', 30, 120, 1, 'm', 'Height above the treetops. Sets photo resolution, overlap and clearance. With elevation loaded the drone follows the terrain to hold this height. 80 to 100 m is a sensible start over tall canopy.')}
+        ${slider('canopyM', 'Tree height', 0, 70, 1, 'm', 'Added to ground elevation to estimate the treetops. Use the tallest trees, not the average. Lowland Sumatran forest has emergents of 50 to 60 m. Set 0 for open ground.')}
+        ${slider('minClearanceM', 'Minimum clearance', 10, 60, 1, 'm', 'Smallest allowed gap between the drone and the estimated treetops anywhere on the path. The Air 2S cannot sense obstacles to the side, so keep a margin for trees taller than you allowed for.')}
         ${slider('frontOverlap', 'Front overlap', 0.6, 0.9, 0.01, '%', 'How much each photo overlaps the next along a line. 80% suits forest, where leaves move and texture repeats.')}
         ${slider('sideOverlap', 'Side overlap', 0.6, 0.9, 0.01, '%', 'How much neighbouring lines overlap. Sets line spacing exactly. 80% for forest.')}
         ${slider('speedMs', 'Speed', 2, 12, 0.5, 'm/s', 'Ground speed on mapping lines. Slower is smoother and gives sharper photos. The Air 2S needs at least 2 s between photos, so too fast turns the interval check red.')}
@@ -579,12 +635,22 @@ function renderStep() {
       $body.innerHTML = `
         <h2>Review</h2>
         ${p.exportBlocked ? `<div class="banner fail">Export is blocked until the red items are fixed.</div>` : ''}
+        ${terrainBanner(p)}
         <dl class="kv">
           <dt>Ground resolution</dt><dd>${p.gsdCm.toFixed(2)} cm/px</dd>
           <dt>Photo footprint</dt><dd>${p.footprint.across.toFixed(0)} × ${p.footprint.along.toFixed(0)} m</dd>
           <dt>Line spacing</dt><dd>${p.lineSpacingM.toFixed(1)} m</dd>
           <dt>Photo spacing</dt><dd>${p.photoSpacingM.toFixed(1)} m (${p.photoIntervalS.toFixed(1)} s)</dd>
           <dt>Line direction</dt><dd>${p.angleDeg.toFixed(0)}°</dd>
+          ${
+            p.terrain
+              ? `<dt>Takeoff elevation</dt><dd>${p.terrain.homeElevM.toFixed(0)} m</dd>
+          <dt>Ground under lines</dt><dd>${p.terrain.minGroundM.toFixed(0)} to ${p.terrain.maxGroundM.toFixed(0)} m</dd>
+          <dt>Clearance on lines</dt><dd>${p.minLineClearanceM.toFixed(0)} m above trees</dd>
+          <dt>Clearance on climb-out</dt><dd>${p.minClearanceM.toFixed(0)} m above trees</dd>
+          <dt>RTH altitude</dt><dd>at least ${p.terrain.rthAltM} m</dd>`
+              : ''
+          }
           <dt>Missions</dt><dd>${p.missions.length}</dd>
           <dt>Photos (approx.)</dt><dd>${p.photoCount}</dd>
           <dt>Total flight time</dt><dd>${mmss(p.totalTimeS)}</dd>
@@ -600,6 +666,7 @@ function renderStep() {
         update();
       });
       on('next', () => goto(4));
+      on('retryterrain', () => ensureTerrain(true));
       break;
     }
 
@@ -630,7 +697,11 @@ function renderStep() {
           <button class="btn" id="kml" ${blocked ? 'disabled' : ''}>KML for Google Earth</button>
           <button class="btn" id="report">Plan report</button>
         </div>
-        <p class="hint">The KML shows paths at the planned height above ground at each point, which is only right on flat terrain. Use it to eyeball the layout, not clearance.</p>`;
+        <p class="hint">${
+          p.terrain
+            ? 'The KML uses absolute altitudes from the elevation data, so Google Earth shows the path against its own terrain. Turn on 3D terrain there to inspect clearance.'
+            : 'No elevation data: the KML shows paths at the planned height above whatever ground is below, which is only right on flat terrain.'
+        }</p>`;
       $body.querySelectorAll('button[data-dl]').forEach((b) =>
         b.addEventListener('click', () => {
           const f = missionFile(Number((b as HTMLElement).dataset.dl));
@@ -838,6 +909,16 @@ function update() {
   refreshMarkers();
   refreshMap();
   render();
+  if (state.polygon.length >= 3 && !hasTiles(tilesFor(terrainPoints(), TERRAIN_ZOOM)) && terrainState !== 'loading') ensureTerrain();
+}
+
+function terrainBanner(p: Plan): string {
+  if (terrainState === 'loading') return `<div class="banner caution">Loading elevation data for this area…</div>`;
+  if (terrainState === 'error')
+    return `<div class="banner fail">Elevation data could not be loaded: ${esc(terrainError)} <button class="btn" id="retryterrain">Retry</button></div>`;
+  if (p.terrainStatus === 'incomplete')
+    return `<div class="banner caution">Elevation data does not cover the whole plan yet. <button class="btn" id="retryterrain">Load</button></div>`;
+  return '';
 }
 
 // ---------- Actions ----------
@@ -887,7 +968,7 @@ function missionFile(i: number): File {
       trigger: s.trigger,
       photoSpacingM: p.photoSpacingM,
       photoIntervalS: p.photoIntervalS,
-    }),
+    }, p.homeXY),
   );
   return new File([csv], `${slug()}-m${m.index}-of-${p.missions.length}.csv`, { type: 'text/csv' });
 }
@@ -900,10 +981,15 @@ function reportFile(): File {
   const L: string[] = [];
   L.push(`DroneCraft plan: ${state.name}`, `Generated ${new Date().toISOString()}`, '');
   L.push(`Takeoff: ${state.home![1].toFixed(6)}, ${state.home![0].toFixed(6)}`);
-  L.push(`Altitude above takeoff: ${s.altitudeM} m`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
+  L.push(`Height above trees: ${s.altitudeM} m (tree height ${s.canopyM} m, minimum clearance ${s.minClearanceM} m)`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
   L.push(`Speed: ${s.speedMs} m/s`, `Trigger: ${s.trigger === 'distance' ? `every ${p.photoSpacingM.toFixed(1)} m` : `every ${p.photoIntervalS.toFixed(1)} s`}`);
   L.push(`GSD: ${p.gsdCm.toFixed(2)} cm/px`, `Line spacing: ${p.lineSpacingM.toFixed(1)} m`, `Line direction: ${p.angleDeg.toFixed(0)} deg`);
-  L.push(`Photos (approx): ${p.photoCount}`, `Total flight time: ${mmss(p.totalTimeS)}`, '');
+  L.push(`Photos (approx): ${p.photoCount}`, `Total flight time: ${mmss(p.totalTimeS)}`);
+  if (p.terrain) {
+    L.push(`Elevation: ${p.terrain.source}`, `Takeoff elevation: ${p.terrain.homeElevM.toFixed(0)} m, ground under lines ${p.terrain.minGroundM.toFixed(0)} to ${p.terrain.maxGroundM.toFixed(0)} m`);
+    L.push(`Lowest clearance above trees: ${p.minLineClearanceM.toFixed(0)} m on lines, ${p.minClearanceM.toFixed(0)} m overall`, `Recommended RTH altitude: ${p.terrain.rthAltM} m`);
+  } else L.push('Elevation: not loaded, altitudes assume flat ground');
+  L.push('');
   L.push('MISSIONS');
   p.missions.forEach((m) =>
     L.push(`  ${m.index}. ${m.waypointCount} wp, ${mmss(m.timeS)}, ${(m.totalDistanceM / 1000).toFixed(2)} km, farthest ${m.maxDistFromHomeM.toFixed(0)} m${m.splitLine ? ', line cut' : ''}`),
@@ -919,6 +1005,7 @@ function reportFile(): File {
     'Camera: JPEG or RAW+JPEG, exposure locked, focus infinity, gimbal -90',
     `SD card has room for ${p.photoCount} photos (about ${((p.photoCount * 9) / 1024).toFixed(1)} GB)`,
     `${p.missions.length} batteries charged`,
+    ...(p.terrain ? [`RTH altitude in DJI Fly set to at least ${p.terrain.rthAltM} m`] : []),
     'Launch from the planned takeoff point, GPS locked, line of sight to the far corner',
     'If a mission stops: note the waypoint, swap battery, restart the mission from that waypoint',
   ].forEach((t) => L.push(`  [ ] ${t}`));
@@ -954,8 +1041,13 @@ async function shareOrDownload(files: File[], title: string) {
   for (const f of files) downloadFile(f);
 }
 
+// Retry elevation automatically when the connection comes back.
+window.addEventListener('online', () => {
+  if (terrainState === 'error') ensureTerrain(true);
+});
+
 // Exposed for automated smoke tests.
-(window as any).__dronecraft = { state, getPlan: () => plan, update, store };
+(window as any).__dronecraft = { state, getPlan: () => plan, update, store, terrainState: () => terrainState };
 
 recompute();
 refreshMarkers();

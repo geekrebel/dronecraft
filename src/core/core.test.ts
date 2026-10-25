@@ -262,7 +262,7 @@ describe('checks', () => {
     expect(status(buildPlan({ ...base, maxRangeM: 300 }), 'range')).toBe('fail');
   });
   it('altitude over limit fails', () => {
-    expect(status(buildPlan({ ...base, altitudeM: 130 }), 'altitude')).toBe('fail');
+    expect(status(buildPlan({ ...base, altitudeM: 130 }), 'height')).toBe('fail');
   });
   it('no elevation data and unchecked GEO zone are cautions, not failures', () => {
     const p = buildPlan(base);
