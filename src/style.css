@@ -107,3 +107,14 @@ input[type='text'] {
   font-weight: 800; font-size: 13px; display: grid; place-items: center; box-shadow: 0 1px 4px rgba(0,0,0,0.5);
   pointer-events: none;
 }
+.vertex { width: 22px; height: 22px; box-shadow: 0 1px 4px rgba(0,0,0,0.5); touch-action: none; }
+.midpoint {
+  width: 22px; height: 22px; border-radius: 50%; background: rgba(15, 24, 19, 0.85); border: 2px solid var(--accent);
+  color: var(--accent); font-weight: 800; font-size: 16px; line-height: 1; display: grid; place-items: center;
+  cursor: copy; touch-action: none; opacity: 0.9;
+}
+.centre {
+  width: 30px; height: 30px; border-radius: 8px; background: rgba(15, 24, 19, 0.85); border: 2px solid #fff;
+  color: #fff; font-size: 18px; display: grid; place-items: center; cursor: move; touch-action: none;
+}
+.home-pin { touch-action: none; }

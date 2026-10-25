@@ -51,7 +51,7 @@ export function displayGeometry(plan: Plan, home: LngLat, colors: string[], maxP
   const photos: Feature<Point>[] = [];
   const starts: DisplayGeometry['starts'] = [];
 
-  const arrowSize = Math.max(6, Math.min(40, plan.lineSpacingM * 0.5));
+  const arrowSize = Math.max(4, Math.min(25, plan.lineSpacingM * 0.3));
   const arrowEvery = Math.max(arrowSize * 6, 120);
   const photoStep = plan.photoSpacingM;
   const totalPhotos = plan.missions.reduce((n, m) => n + m.lines.reduce((k, l) => k + lineLength(l) / photoStep, 0), 0);

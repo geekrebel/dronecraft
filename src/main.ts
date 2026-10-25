@@ -1,10 +1,14 @@
 import * as maplibregl from 'maplibre-gl';
 import { GeoJSONSource, Map as MlMap, Marker } from 'maplibre-gl';
+// MapLibre 6 looks for its worker next to its own script, which doesn't exist after bundling. Ship it explicitly.
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url';
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './style.css';
 import { registerSW } from 'virtual:pwa-register';
 import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
-import { LngLat } from './core/projection';
+import { LngLat, centroid } from './core/projection';
+import { defaultHome, edgeMidpoints, squareAround, translate } from './core/shapes';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
 import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
 import { displayGeometry } from './core/display';
@@ -22,7 +26,8 @@ interface State {
   basemap: 'map' | 'satellite';
 }
 
-const STORE = 'dronecraft:v1';
+const STORE = 'dronecraft:v2';
+const DEFAULT_SQUARE_M = 200;
 const BUKIT_LAWANG: LngLat = [98.12, 3.55];
 const MISSION_COLORS = ['#d9f99d', '#67e8f9', '#f9a8d4', '#fdba74', '#c4b5fd', '#86efac', '#fde047'];
 
@@ -78,7 +83,7 @@ const map = new MlMap({
     ],
   },
   center: state.polygon[0] ?? BUKIT_LAWANG,
-  zoom: state.polygon.length ? 15 : 13,
+  zoom: 16,
   attributionControl: { compact: true },
 });
 map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right');
@@ -150,55 +155,153 @@ map.on('load', () => {
     type: 'line',
     source: 'arrows',
     layout: { 'line-cap': 'round', 'line-join': 'round' },
-    paint: { 'line-color': '#0b120e', 'line-width': 2.5 },
+    paint: { 'line-color': '#0b120e', 'line-width': 2 },
   });
-  if (state.polygon.length >= 3) fitArea();
+  if (state.polygon.length < 3) newSquare(false);
+  else fitArea();
+  refreshMarkers();
   refreshMap();
+  render();
 });
 
+// Tapping the map only sets takeoff, and only on the takeoff step. The area is edited with handles.
 map.on('click', (e) => {
-  const p: LngLat = [e.lngLat.lng, e.lngLat.lat];
-  if (state.step === 0) {
-    state.polygon.push(p);
-  } else if (state.step === 1) {
-    state.home = p;
-  } else return;
+  if (state.step !== 1) return;
+  state.home = [e.lngLat.lng, e.lngLat.lat];
   update();
 });
 
+/** Replace the area with a default square in the middle of the current view. */
+function newSquare(keepHome: boolean) {
+  const c = map.getCenter();
+  state.polygon = squareAround([c.lng, c.lat], DEFAULT_SQUARE_M);
+  if (!keepHome || !state.home) state.home = defaultHome(state.polygon);
+  recompute();
+  save();
+  fitArea();
+}
+
 let vertexMarkers: Marker[] = [];
+let midMarkers: Marker[] = [];
+let centreMarker: Marker | null = null;
 let homeMarker: Marker | null = null;
 
+/** Move the edge and centre handles to follow the current polygon without rebuilding them. */
+function positionHandles() {
+  const mids = edgeMidpoints(state.polygon);
+  midMarkers.forEach((m, i) => mids[i] && m.setLngLat(mids[i]));
+  centreMarker?.setLngLat(centroid(state.polygon));
+}
+
+/** Live redraw during a drag, without touching the panel. */
+function dragRedraw() {
+  recompute();
+  positionHandles();
+  refreshMap();
+  renderStats();
+}
+
+/** Run after the current event finishes, so a marker is never removed while MapLibre is handling it. */
+function later(fn: () => void) {
+  setTimeout(fn, 0);
+}
+
+function handle(cls: string, text = '', title = ''): HTMLDivElement {
+  const el = document.createElement('div');
+  el.className = cls;
+  el.textContent = text;
+  el.title = title;
+  return el;
+}
+
 function refreshMarkers() {
-  vertexMarkers.forEach((m) => m.remove());
+  [...vertexMarkers, ...midMarkers].forEach((m) => m.remove());
   vertexMarkers = [];
-  if (state.step === 0) {
+  midMarkers = [];
+  centreMarker?.remove();
+  centreMarker = null;
+
+  if (state.step === 0 && state.polygon.length >= 3) {
+    // Corners: drag to move, double-tap to delete.
     state.polygon.forEach((p, i) => {
-      const el = document.createElement('div');
-      el.className = 'vertex';
-      el.title = 'Drag to move';
+      const el = handle('vertex', '', 'Drag to move. Double-tap to delete.');
       const mk = new Marker({ element: el, draggable: true }).setLngLat(p).addTo(map);
       mk.on('drag', () => {
         const ll = mk.getLngLat();
         state.polygon[i] = [ll.lng, ll.lat];
-        recompute();
-        refreshMap();
+        dragRedraw();
       });
-      mk.on('dragend', () => update());
+      mk.on('dragend', () => later(update));
+      // Own double-tap detection: iOS Safari does not fire dblclick reliably.
+      let lastTap = 0;
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const now = Date.now();
+        if (now - lastTap < 400 && state.polygon.length > 3) {
+          state.polygon.splice(i, 1);
+          later(update);
+        }
+        lastTap = now;
+      });
       vertexMarkers.push(mk);
     });
+
+    // Edge "+" handles: tap or drag to insert a corner on that edge.
+    edgeMidpoints(state.polygon).forEach((p, i) => {
+      const el = handle('midpoint', '+', 'Tap or drag to add a corner');
+      const mk = new Marker({ element: el, draggable: true }).setLngLat(p).addTo(map);
+      let inserted = false;
+      mk.on('dragstart', () => {
+        state.polygon.splice(i + 1, 0, [mk.getLngLat().lng, mk.getLngLat().lat]);
+        inserted = true;
+        el.className = 'vertex';
+        el.textContent = '';
+      });
+      mk.on('drag', () => {
+        if (!inserted) return;
+        const ll = mk.getLngLat();
+        state.polygon[i + 1] = [ll.lng, ll.lat];
+        recompute();
+        refreshMap();
+        renderStats();
+      });
+      mk.on('dragend', () => later(update));
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (inserted) return;
+        inserted = true;
+        state.polygon.splice(i + 1, 0, p);
+        later(update);
+      });
+      midMarkers.push(mk);
+    });
+
+    // Centre handle: drag to move the whole area.
+    const el = handle('centre', '✥', 'Drag to move the whole area');
+    centreMarker = new Marker({ element: el, draggable: true }).setLngLat(centroid(state.polygon)).addTo(map);
+    let last: LngLat = centroid(state.polygon);
+    centreMarker.on('dragstart', () => (last = centroid(state.polygon)));
+    centreMarker.on('drag', () => {
+      const ll = centreMarker!.getLngLat();
+      state.polygon = translate(state.polygon, ll.lng - last[0], ll.lat - last[1]);
+      last = [ll.lng, ll.lat];
+      vertexMarkers.forEach((m, i) => m.setLngLat(state.polygon[i]));
+      dragRedraw();
+    });
+    centreMarker.on('dragend', () => later(update));
   }
+
   if (state.home) {
     if (!homeMarker) {
-      const el = document.createElement('div');
-      el.className = 'home-pin';
-      el.textContent = 'H';
-      homeMarker = new Marker({ element: el, draggable: true }).setLngLat(state.home).addTo(map);
-      homeMarker.on('dragend', () => {
+      homeMarker = new Marker({ element: handle('home-pin', 'H', 'Takeoff. Drag to move.'), draggable: true })
+        .setLngLat(state.home)
+        .addTo(map);
+      homeMarker.on('drag', () => {
         const ll = homeMarker!.getLngLat();
         state.home = [ll.lng, ll.lat];
-        update();
+        dragRedraw();
       });
+      homeMarker.on('dragend', () => later(update));
     } else homeMarker.setLngLat(state.home);
   } else if (homeMarker) {
     homeMarker.remove();
@@ -315,7 +418,7 @@ function renderStats() {
 }
 
 function modeText() {
-  if (state.step === 0) return state.polygon.length < 3 ? `Tap the map to add corners (${state.polygon.length}/3+)` : 'Tap to add corners, drag to move';
+  if (state.step === 0) return 'Drag corners · tap + to add · drag ✥ to move';
   if (state.step === 1) return 'Tap the map to set the takeoff point';
   return '';
 }
@@ -328,10 +431,9 @@ function renderStep() {
     case 0:
       $body.innerHTML = `
         <h2>Mapping area</h2>
-        <p class="hint">Tap the map to place the corners of the area you want to map, in order around the edge. Drag a corner to adjust it. You can also import a boundary from a KML or GeoJSON file.</p>
+        <p class="hint">Drag the corners to fit your area. Tap or drag a <b>+</b> on an edge to add a corner. Double-tap a corner to remove it. Drag the centre handle to move the whole area. You can also import a boundary from a KML or GeoJSON file.</p>
         <div class="row">
-          <button class="btn" id="undo" ${state.polygon.length ? '' : 'disabled'}>Undo corner</button>
-          <button class="btn" id="clear" ${state.polygon.length ? '' : 'disabled'}>Clear</button>
+          <button class="btn" id="square">New square here</button>
           <label class="btn">Import KML / GeoJSON<input id="import" type="file" accept=".kml,.geojson,.json" hidden></label>
         </div>
         <div class="field"><div class="top"><label for="name">Site name</label></div>
@@ -341,12 +443,8 @@ function renderStep() {
           <div class="seg"><button data-b="map" class="${state.basemap === 'map' ? 'on' : ''}">Street</button><button data-b="satellite" class="${state.basemap === 'satellite' ? 'on' : ''}">Satellite</button></div></div>
           <div class="help">Satellite imagery needs a connection and is not stored for offline use.</div></div>
         <div class="row"><button class="btn primary" id="next" ${state.polygon.length >= 3 ? '' : 'disabled'}>Next: takeoff</button></div>`;
-      on('undo', () => {
-        state.polygon.pop();
-        update();
-      });
-      on('clear', () => {
-        state.polygon = [];
+      on('square', () => {
+        newSquare(true);
         update();
       });
       ($body.querySelector('#import') as HTMLInputElement).addEventListener('change', importFile);
@@ -363,7 +461,7 @@ function renderStep() {
     case 1:
       $body.innerHTML = `
         <h2>Takeoff point</h2>
-        <p class="hint">Tap the map where you will launch, or use your current position. Pick a clearing with open sky and line of sight to the far end of the area. Litchi altitudes are measured from this point, so launch where you planned.</p>
+        <p class="hint">Drag the H marker or tap the map where you will launch, or use your current position. Pick a clearing with open sky and line of sight to the far end of the area. Litchi altitudes are measured from this point, so launch where you planned.</p>
         <div class="row">
           <button class="btn" id="gps">Use my position</button>
           <button class="btn" id="fit" ${state.polygon.length >= 2 ? '' : 'disabled'}>Zoom to area</button>
