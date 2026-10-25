@@ -7,6 +7,7 @@ import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
 import { LngLat } from './core/projection';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
 import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
+import { displayGeometry } from './core/display';
 
 registerSW({ immediate: true });
 
@@ -92,22 +93,64 @@ document.getElementById('map')!.appendChild(modeLabel);
 
 const empty = { type: 'FeatureCollection' as const, features: [] };
 map.on('load', () => {
-  map.addSource('area', { type: 'geojson', data: empty });
-  map.addSource('lines', { type: 'geojson', data: empty });
-  map.addSource('transit', { type: 'geojson', data: empty });
-  map.addLayer({ id: 'area-fill', type: 'fill', source: 'area', paint: { 'fill-color': '#d9f99d', 'fill-opacity': 0.12 } });
-  map.addLayer({ id: 'area-line', type: 'line', source: 'area', paint: { 'line-color': '#d9f99d', 'line-width': 2 } });
+  for (const id of ['area', 'lines', 'turns', 'transit', 'arrows', 'photos']) {
+    map.addSource(id, { type: 'geojson', data: empty });
+  }
+  map.addLayer({ id: 'area-fill', type: 'fill', source: 'area', paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.1 } });
+  map.addLayer({
+    id: 'area-line',
+    type: 'line',
+    source: 'area',
+    paint: { 'line-color': '#ffffff', 'line-width': 2, 'line-opacity': 0.9 },
+  });
   map.addLayer({
     id: 'transit',
     type: 'line',
     source: 'transit',
-    paint: { 'line-color': ['get', 'color'], 'line-width': 1.5, 'line-dasharray': [2, 2], 'line-opacity': 0.8 },
+    layout: { 'line-cap': 'round' },
+    paint: { 'line-color': ['get', 'color'], 'line-width': 2, 'line-dasharray': [1.5, 2], 'line-opacity': 0.85 },
+  });
+  map.addLayer({
+    id: 'turns',
+    type: 'line',
+    source: 'turns',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': ['get', 'color'], 'line-width': 2, 'line-opacity': 0.7 },
+  });
+  // Dark casing under the mapping lines keeps them readable on satellite imagery.
+  map.addLayer({
+    id: 'lines-casing',
+    type: 'line',
+    source: 'lines',
+    layout: { 'line-cap': 'round' },
+    paint: { 'line-color': '#0b120e', 'line-width': 5.5, 'line-opacity': 0.6 },
   });
   map.addLayer({
     id: 'lines',
     type: 'line',
     source: 'lines',
-    paint: { 'line-color': ['get', 'color'], 'line-width': 2.5 },
+    layout: { 'line-cap': 'round' },
+    paint: { 'line-color': ['get', 'color'], 'line-width': 3 },
+  });
+  map.addLayer({
+    id: 'photos',
+    type: 'circle',
+    source: 'photos',
+    minzoom: 15,
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 15, 1.5, 19, 4],
+      'circle-color': '#ffffff',
+      'circle-stroke-color': '#0b120e',
+      'circle-stroke-width': 0.8,
+      'circle-opacity': 0.9,
+    },
+  });
+  map.addLayer({
+    id: 'arrows',
+    type: 'line',
+    source: 'arrows',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#0b120e', 'line-width': 2.5 },
   });
   if (state.polygon.length >= 3) fitArea();
   refreshMap();
@@ -163,8 +206,15 @@ function refreshMarkers() {
   }
 }
 
+let startMarkers: Marker[] = [];
+
+function setData(id: string, data: any) {
+  (map.getSource(id) as GeoJSONSource | undefined)?.setData(data);
+}
+
 function refreshMap() {
-  if (!map.isStyleLoaded() || !map.getSource('area')) return;
+  // Only wait for our own sources. isStyleLoaded() is false while tiles load, which used to skip drawing.
+  if (!map.getSource('area')) return;
   const ring = state.polygon;
   const areaFeature =
     ring.length >= 3
@@ -174,21 +224,37 @@ function refreshMap() {
         : null;
   (map.getSource('area') as GeoJSONSource).setData({ type: 'FeatureCollection', features: areaFeature ? [areaFeature] : [] } as any);
 
-  const lineFeatures: any[] = [];
-  const transitFeatures: any[] = [];
-  if (plan && state.home) {
-    plan.missions.forEach((m, i) => {
-      const color = MISSION_COLORS[i % MISSION_COLORS.length];
-      const pts = m.lines.flatMap((l) => [plan!.proj.toLngLat(l.start), plan!.proj.toLngLat(l.end)]);
-      lineFeatures.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: pts }, properties: { color } });
-      transitFeatures.push(
-        { type: 'Feature', geometry: { type: 'LineString', coordinates: [state.home, pts[0]] }, properties: { color } },
-        { type: 'Feature', geometry: { type: 'LineString', coordinates: [pts[pts.length - 1], state.home] }, properties: { color } },
-      );
-    });
+  startMarkers.forEach((m) => m.remove());
+  startMarkers = [];
+  // Before a takeoff point is set, preview the grid from the area's centre so lines show while drawing.
+  const shown = plan ?? previewPlan();
+  if (!shown) {
+    for (const id of ['lines', 'turns', 'transit', 'arrows', 'photos']) setData(id, empty);
+    return;
   }
-  (map.getSource('lines') as GeoJSONSource).setData({ type: 'FeatureCollection', features: lineFeatures });
-  (map.getSource('transit') as GeoJSONSource).setData({ type: 'FeatureCollection', features: transitFeatures });
+  const home = state.home ?? shown.input.home;
+  const g = displayGeometry(shown, home, MISSION_COLORS);
+  setData('lines', g.lines);
+  setData('turns', g.turns);
+  setData('arrows', g.arrows);
+  setData('photos', g.photos);
+  setData('transit', state.home ? g.transit : empty);
+  if (state.home) {
+    for (const s of g.starts) {
+      const el = document.createElement('div');
+      el.className = 'start-pin';
+      el.style.background = s.color;
+      el.textContent = String(s.mission);
+      el.title = `Mission ${s.mission} starts here`;
+      startMarkers.push(new Marker({ element: el }).setLngLat(s.at).addTo(map));
+    }
+  }
+}
+
+function previewPlan(): Plan | null {
+  if (state.polygon.length < 3) return null;
+  const c = state.polygon.reduce<LngLat>((a, p) => [a[0] + p[0] / state.polygon.length, a[1] + p[1] / state.polygon.length], [0, 0]);
+  return buildPlan({ ...state.settings, polygon: state.polygon, home: c });
 }
 
 function fitArea() {
