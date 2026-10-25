@@ -23,10 +23,11 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 ## 3. Features
 
 ### 3.1 Site and area
-- **[MVP]** Draw a polygon on a map (tap to add vertices, drag to edit, delete vertex).
+- **[MVP]** New areas start as a 200 m square with takeoff 20 m south. Drag corners, tap or drag edge + handles to add corners, double-tap a corner to delete it, drag the centre handle to move the area.
 - **[MVP]** Import a boundary from KML or GeoJSON.
 - **[MVP]** Set takeoff point by tapping the map or using the device's GPS.
-- **[v1]** Multiple named sites, saved locally.
+- **[MVP]** Multiple named plans saved on the device: new, open, rename, duplicate, delete (with confirm).
+- **[MVP]** Reset: new plan, new square, reset settings to defaults.
 - **[v2]** Exclusion zones (holes) inside the polygon.
 
 ### 3.2 Camera model
@@ -101,8 +102,8 @@ Each check returns pass, caution (amber, export allowed with explanation) or fai
 
 ### 3.9 Offline
 - **[MVP]** PWA with service worker: app shell works offline after first load.
-- **[MVP]** Current plan saved in localStorage.
-- **[v1]** Multiple plans and offline data in IndexedDB.
+- **[MVP]** Plans saved in localStorage.
+- **[v1]** Offline elevation and imagery data in IndexedDB.
 - **[v1]** "Download site for offline": DEM, canopy raster and base map tiles for the bounding box stored in IndexedDB. Base map from OpenStreetMap-derived tiles that permit caching; no caching of Google or Esri imagery.
 - **[v1]** User-supplied georeferenced image overlay (e.g. Sentinel-2) as offline satellite background.
 

@@ -8,7 +8,8 @@ import './style.css';
 import { registerSW } from 'virtual:pwa-register';
 import { DEFAULT_INPUT, Plan, PlanInput, buildPlan } from './core/plan';
 import { LngLat, centroid } from './core/projection';
-import { defaultHome, edgeMidpoints, squareAround, translate } from './core/shapes';
+import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './core/shapes';
+import { KV, PlanDoc, PlanStore, uniqueName } from './core/store';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
 import { polygonFromGeoJson, polygonFromKml, toKml } from './core/kml';
 import { displayGeometry } from './core/display';
@@ -18,37 +19,84 @@ registerSW({ immediate: true });
 // ---------- State ----------
 type Settings = Omit<PlanInput, 'polygon' | 'home'>;
 interface State {
+  id: string;
   name: string;
   polygon: LngLat[];
   home: LngLat | null;
   settings: Settings;
   step: number;
   basemap: 'map' | 'satellite';
+  view: 'steps' | 'plans';
 }
 
-const STORE = 'dronecraft:v2';
+const UI_KEY = 'dronecraft:ui:v1';
+const LEGACY_KEY = 'dronecraft:v2';
 const DEFAULT_SQUARE_M = 200;
 const BUKIT_LAWANG: LngLat = [98.12, 3.55];
 const MISSION_COLORS = ['#d9f99d', '#67e8f9', '#f9a8d4', '#fdba74', '#c4b5fd', '#86efac', '#fde047'];
 
-function load(): State {
-  const fresh: State = { name: 'site', polygon: [], home: null, settings: { ...DEFAULT_INPUT }, step: 0, basemap: 'map' };
+function safeStorage(): KV {
   try {
-    const raw = localStorage.getItem(STORE);
-    if (!raw) return fresh;
-    const s = JSON.parse(raw);
-    return { ...fresh, ...s, settings: { ...DEFAULT_INPUT, ...s.settings } };
+    const k = '__dc_test__';
+    localStorage.setItem(k, '1');
+    localStorage.removeItem(k);
+    return localStorage;
   } catch {
-    return fresh;
+    const m = new Map<string, string>();
+    return { getItem: (k) => m.get(k) ?? null, setItem: (k, v) => void m.set(k, v) };
   }
+}
+const kv = safeStorage();
+const store = new PlanStore<Settings>(kv);
+
+// One-time import of the single plan saved by earlier versions.
+if (!store.list().length) {
+  try {
+    const legacy = JSON.parse(kv.getItem(LEGACY_KEY) ?? 'null');
+    if (legacy?.polygon?.length >= 3) {
+      store.create({ name: legacy.name && legacy.name !== 'site' ? legacy.name : 'Plan', polygon: legacy.polygon, home: legacy.home ?? null, settings: { ...DEFAULT_INPUT, ...legacy.settings } });
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function load(): State {
+  let ui: Partial<Pick<State, 'step' | 'basemap'>> = {};
+  try {
+    ui = JSON.parse(kv.getItem(UI_KEY) ?? '{}');
+  } catch {
+    /* ignore */
+  }
+  const doc = store.current() ?? store.create({ name: 'Plan', polygon: [], home: null, settings: { ...DEFAULT_INPUT } });
+  return {
+    id: doc.id,
+    name: doc.name,
+    polygon: doc.polygon,
+    home: doc.home,
+    settings: { ...DEFAULT_INPUT, ...doc.settings },
+    step: ui.step ?? 0,
+    basemap: ui.basemap ?? 'map',
+    view: 'steps',
+  };
 }
 const state = load();
 function save() {
+  store.save({ id: state.id, name: state.name, polygon: state.polygon, home: state.home, settings: state.settings, updatedAt: 0 });
   try {
-    localStorage.setItem(STORE, JSON.stringify(state));
+    kv.setItem(UI_KEY, JSON.stringify({ step: state.step, basemap: state.basemap }));
   } catch {
-    /* storage unavailable: app still works for this session */
+    /* ignore */
   }
+}
+
+/** Load a stored plan into the editor. */
+function applyDoc(doc: PlanDoc<Settings>) {
+  state.id = doc.id;
+  state.name = doc.name;
+  state.polygon = structuredClone(doc.polygon);
+  state.home = doc.home ? [...doc.home] : null;
+  state.settings = { ...DEFAULT_INPUT, ...doc.settings };
 }
 
 let plan: Plan | null = null;
@@ -436,9 +484,9 @@ function renderStep() {
           <button class="btn" id="square">New square here</button>
           <label class="btn">Import KML / GeoJSON<input id="import" type="file" accept=".kml,.geojson,.json" hidden></label>
         </div>
-        <div class="field"><div class="top"><label for="name">Site name</label></div>
+        <div class="field"><div class="top"><label for="name">Plan name</label></div>
           <input id="name" type="text" value="${esc(state.name)}" maxlength="40" />
-          <div class="help">Used for file names.</div></div>
+          <div class="help">Used for the plan list and file names. Open the plan list from the name at the top.</div></div>
         <div class="field"><div class="top"><label>Map</label>
           <div class="seg"><button data-b="map" class="${state.basemap === 'map' ? 'on' : ''}">Street</button><button data-b="satellite" class="${state.basemap === 'satellite' ? 'on' : ''}">Satellite</button></div></div>
           <div class="help">Satellite imagery needs a connection and is not stored for offline use.</div></div>
@@ -450,6 +498,7 @@ function renderStep() {
       ($body.querySelector('#import') as HTMLInputElement).addEventListener('change', importFile);
       ($body.querySelector('#name') as HTMLInputElement).addEventListener('input', (e) => {
         state.name = (e.target as HTMLInputElement).value;
+        $planName.textContent = state.name || 'Untitled';
         save();
       });
       $body.querySelectorAll('.seg button[data-b]').forEach((b) =>
@@ -493,8 +542,14 @@ function renderStep() {
         ${slider('batteryMin', 'Battery flight time', 15, 31, 1, 'min', 'Usable time per battery. The Air 2S is rated 31 min in still air; 27 is realistic for mapping.')}
         ${slider('reservePct', 'Battery reserve', 0.15, 0.4, 0.01, '%', 'Kept in hand for wind, the return leg and landing. 30% is a safe default in hills.')}
         ${slider('maxRangeM', 'Max distance from takeoff', 200, 3000, 50, 'm', 'Virtual stick needs the link the whole time. In hills and forest, keep this short enough for line of sight.')}
-        ${slider('maxAltitudeM', 'Max altitude', 60, 500, 10, 'm', 'Legal ceiling. 120 m in Australia and Indonesia for normal operations.')}`;
+        ${slider('maxAltitudeM', 'Max altitude', 60, 500, 10, 'm', 'Legal ceiling. 120 m in Australia and Indonesia for normal operations.')}
+        <div class="row" style="margin-top:16px"><button class="btn" id="resetsettings">Reset settings to defaults</button></div>
+        <p class="hint">Resets flight settings and limits only. The area and takeoff point stay as they are.</p>`;
       bindSliders();
+      on('resetsettings', () => {
+        state.settings = { ...DEFAULT_INPUT, geoZoneChecked: state.settings.geoZoneChecked };
+        update();
+      });
       $body.querySelectorAll('.seg button[data-trig]').forEach((b) =>
         b.addEventListener('click', () => {
           state.settings.trigger = (b as HTMLElement).dataset.trig as 'distance' | 'time';
@@ -624,10 +679,109 @@ function goto(step: number) {
   render();
 }
 
+const $planName = document.getElementById('plan-name')!;
+document.getElementById('plans-btn')!.addEventListener('click', () => {
+  state.view = state.view === 'plans' ? 'steps' : 'plans';
+  render();
+});
+
 function render() {
-  renderSteps();
+  $planName.textContent = state.name || 'Untitled';
+  $steps.style.display = state.view === 'plans' ? 'none' : '';
   renderStats();
+  if (state.view === 'plans') {
+    modeLabel.style.display = 'none';
+    renderPlans();
+    return;
+  }
+  renderSteps();
   renderStep();
+}
+
+let pendingDelete: string | null = null;
+
+function renderPlans() {
+  const plans = store.list();
+  const fmtDate = (t: number) => new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  $body.innerHTML = `
+    <h2>Flight plans</h2>
+    <p class="hint">Plans are saved on this device as you work. Open one to edit it, or start a new one.</p>
+    <div class="row"><button class="btn primary" id="newplan">New plan</button><button class="btn" id="back">Back to ${esc(state.name || 'plan')}</button></div>
+    ${plans
+      .map((p) => {
+        const ha = polygonAreaM2(p.polygon) / 10000;
+        const isCur = p.id === state.id;
+        const confirm = pendingDelete === p.id;
+        return `<div class="plan-row${isCur ? ' current' : ''}">
+          <div class="plan-info"><b>${esc(p.name || 'Untitled')}</b>${isCur ? ' <span class="tag">open</span>' : ''}
+            <div class="meta">${ha.toFixed(1)} ha · ${p.polygon.length} corners · ${fmtDate(p.updatedAt)}</div></div>
+          <div class="plan-actions">
+            ${isCur ? '' : `<button class="btn" data-open="${p.id}">Open</button>`}
+            <button class="btn" data-dup="${p.id}">Duplicate</button>
+            <button class="btn ${confirm ? 'danger' : ''}" data-del="${p.id}">${confirm ? 'Tap to confirm' : 'Delete'}</button>
+          </div></div>`;
+      })
+      .join('')}`;
+  on('newplan', newPlan);
+  on('back', () => {
+    state.view = 'steps';
+    render();
+  });
+  $body.querySelectorAll<HTMLElement>('[data-open]').forEach((b) => b.addEventListener('click', () => openPlan(b.dataset.open!)));
+  $body.querySelectorAll<HTMLElement>('[data-dup]').forEach((b) =>
+    b.addEventListener('click', () => {
+      save();
+      const d = store.duplicate(b.dataset.dup!);
+      if (d) openPlan(d.id, true, false);
+    }),
+  );
+  $body.querySelectorAll<HTMLElement>('[data-del]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const id = b.dataset.del!;
+      if (pendingDelete !== id) {
+        pendingDelete = id;
+        renderPlans();
+        return;
+      }
+      pendingDelete = null;
+      const wasCurrent = id === state.id;
+      store.remove(id);
+      if (wasCurrent) {
+        const next = store.current();
+        if (next) openPlan(next.id, true, false);
+        else newPlan();
+        return;
+      }
+      renderPlans();
+    }),
+  );
+}
+
+function openPlan(id: string, stayInList = false, saveCurrent = true) {
+  if (saveCurrent && id !== state.id && store.get(state.id)) save();
+  const doc = store.open(id);
+  if (!doc) return;
+  applyDoc(doc);
+  pendingDelete = null;
+  if (!stayInList) state.view = 'steps';
+  update();
+  fitArea();
+}
+
+function newPlan() {
+  save();
+  const doc = store.create({
+    name: uniqueName('Plan', store.list().map((p) => p.name)),
+    polygon: [],
+    home: null,
+    settings: { ...DEFAULT_INPUT },
+  });
+  applyDoc(doc);
+  newSquare(false);
+  state.step = 0;
+  state.view = 'steps';
+  pendingDelete = null;
+  update();
 }
 
 function update() {
@@ -665,7 +819,7 @@ async function importFile(e: Event) {
   if (!ring) return alert('No polygon found in that file.');
   if (ring.length > 1 && ring[0][0] === ring[ring.length - 1][0] && ring[0][1] === ring[ring.length - 1][1]) ring.pop();
   state.polygon = ring;
-  if (state.name === 'site') state.name = file.name.replace(/\.[^.]+$/, '');
+  if (/^Plan( \d+)?$/.test(state.name)) state.name = file.name.replace(/\.[^.]+$/, '');
   update();
   fitArea();
 }
@@ -747,7 +901,7 @@ async function shareAll() {
 }
 
 // Exposed for automated smoke tests.
-(window as any).__dronecraft = { state, getPlan: () => plan, update };
+(window as any).__dronecraft = { state, getPlan: () => plan, update, store };
 
 recompute();
 refreshMarkers();

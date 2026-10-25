@@ -118,3 +118,17 @@ input[type='text'] {
   color: #fff; font-size: 18px; display: grid; place-items: center; cursor: move; touch-action: none;
 }
 .home-pin { touch-action: none; }
+.bar { align-items: center; flex-wrap: wrap; }
+.plans-btn {
+  display: inline-flex; align-items: baseline; gap: 6px; background: #1f3027; border: 1px solid var(--line);
+  border-radius: 999px; padding: 5px 12px; color: var(--text); font: inherit; font-size: 14px; cursor: pointer; max-width: 100%;
+}
+.plan-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
+.caret { color: var(--muted); font-size: 11px; }
+.plan-row { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; margin: 8px 0; }
+.plan-row.current { border-color: var(--accent); }
+.plan-row .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.plan-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.plan-actions .btn { padding: 6px 12px; font-size: 13px; }
+.tag { font-size: 11px; background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 1px 7px; margin-left: 4px; vertical-align: 1px; }
+button.btn.danger { background: #7f1d1d; border-color: #b91c1c; color: #fff; }

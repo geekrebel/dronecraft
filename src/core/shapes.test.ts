@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultHome, edgeMidpoints, squareAround, translate } from './shapes';
+import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './shapes';
 import { centroid, dist, makeProjection } from './projection';
 
 const C: [number, number] = [98.12, 3.55];
@@ -41,5 +41,10 @@ describe('shapes', () => {
       expect(q[0]).toBeCloseTo(sq[i][0] + 0.001, 12);
       expect(q[1]).toBeCloseTo(sq[i][1] - 0.002, 12);
     });
+  });
+
+  it('area of a 200 m square is 4 ha', () => {
+    expect(polygonAreaM2(squareAround(C, 200))).toBeCloseTo(40000, -1);
+    expect(polygonAreaM2(squareAround(C, 200).slice(0, 2))).toBe(0);
   });
 });

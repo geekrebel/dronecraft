@@ -33,3 +33,17 @@ export function edgeMidpoints(polygon: LngLat[]): LngLat[] {
 export function translate(polygon: LngLat[], dLon: number, dLat: number): LngLat[] {
   return polygon.map(([lon, lat]) => [lon + dLon, lat + dLat]);
 }
+
+/** Polygon area in square metres (shoelace in a local metric frame). */
+export function polygonAreaM2(polygon: LngLat[]): number {
+  if (polygon.length < 3) return 0;
+  const p = makeProjection(centroid(polygon));
+  const l = polygon.map((q) => p.toLocal(q));
+  let a = 0;
+  for (let i = 0; i < l.length; i++) {
+    const [x1, y1] = l[i];
+    const [x2, y2] = l[(i + 1) % l.length];
+    a += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(a) / 2;
+}
