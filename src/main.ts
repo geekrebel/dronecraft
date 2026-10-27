@@ -783,7 +783,7 @@ function renderStep() {
           </ul></div>
         <div class="banner fail"><b>Before every flight, in DJI Fly</b>:
           <ul>
-            ${p.terrain ? `<li>RTH altitude at least <b>${p.terrain.rthAltM} m</b>.</li>` : ''}
+            ${p.terrain ? `<li>RTH altitude <b>${p.terrain.rthAltM} m</b>. When a mission ends with Go Home, or the link drops, the drone climbs at up to 6 m/s to this altitude if it is lower, then flies straight home. If it is already higher, it returns at its current altitude. Setting more than this only costs time and battery.</li>` : ''}
             <li>Max altitude at least <b>${Math.ceil(Math.max(p.terrain?.rthAltM ?? 0, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m</b> (and the same in Litchi). The drone will not climb past it.</li>
             <li>Signal lost action: <b>RTH</b>, not hover.</li>
             <li>If DJI Fly offers an RTH path option (Optimal / Preset), choose <b>Preset</b> so it climbs to RTH altitude before flying home.</li>

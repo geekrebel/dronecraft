@@ -309,17 +309,24 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
       minAlt = Math.min(minAlt, w.alt);
     }
     if (terrain) {
-      // RTH can start anywhere on the path, not just at waypoints: sample every 20 m along every leg
-      // and require a straight line home from each sample to clear the trees.
+      // RTH can start anywhere on the path, not just at waypoints. DJI RTH climbs to the RTH altitude
+      // only if the drone is below it, then flies straight home; if it is already higher it returns at
+      // its current altitude. So the RTH altitude only has to cover points where the drone's own
+      // altitude would not clear the straight line home. Sample every 20 m along every leg.
       for (let i = 0; i + 1 < it.wps.length; i++) {
-        const a = it.wps[i].xy;
-        const b = it.wps[i + 1].xy;
-        const n = Math.max(1, Math.ceil(dist(a, b) / 20));
+        const a = it.wps[i];
+        const b = it.wps[i + 1];
+        const n = Math.max(1, Math.ceil(dist(a.xy, b.xy) / 20));
         for (let k = 0; k <= n; k++) {
-          const p: XY = [a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n];
-          rthNeed = Math.max(rthNeed, maxAlong(p, home, need, 20));
+          const t = k / n;
+          const p: XY = [a.xy[0] + (b.xy[0] - a.xy[0]) * t, a.xy[1] + (b.xy[1] - a.xy[1]) * t];
+          const alt = a.alt + (b.alt - a.alt) * t;
+          const required = maxAlong(p, home, need, 20);
+          if (alt < required) rthNeed = Math.max(rthNeed, required);
         }
       }
+      // Never below what is needed directly over takeoff, nor below DJI's 20 m minimum.
+      rthNeed = Math.max(rthNeed, need(home), 20);
     }
   }
   if (!terrain && input.obstacleFloorM > 0) rthNeed = input.obstacleFloorM + input.minClearanceM;
@@ -526,7 +533,7 @@ export function runChecks(a: {
       id: 'rth',
       label: 'Return-to-home altitude',
       status: a.terrain.rthAltM > input.maxAltitudeM ? 'caution' : 'pass',
-      detail: `Set RTH altitude in DJI Fly to at least ${a.terrain.rthAltM} m. That clears the treetops by ${input.minClearanceM} m on a straight line home from any point on the path, checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
+      detail: `Set RTH altitude in DJI Fly to ${a.terrain.rthAltM} m. With it, a return home from any point on the path clears the treetops by ${input.minClearanceM} m: where the drone is already higher it returns at its own altitude, elsewhere it climbs to this first. Checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
     });
   }
 

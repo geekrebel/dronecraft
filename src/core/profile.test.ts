@@ -112,11 +112,25 @@ describe('buildPlan with terrain', () => {
     }
     expect(p.minClearanceM).toBeGreaterThanOrEqual(30 - 1e-6);
     expect(p.terrain!.rthAltM % 5).toBe(0);
-    // RTH must clear trees + minimum clearance over the highest ground the path reaches, but needs no more
-    // than the mapping altitude there (minimum clearance is below the mapping height above trees).
-    const wpAlts = p.missions.flatMap((m) => m.itinerary!.filter((w) => w.kind !== 'climb').map((w) => w.alt));
-    expect(p.terrain!.rthAltM).toBeGreaterThanOrEqual(Math.max(...wpAlts) - 80 + 30);
-    expect(p.terrain!.rthAltM).toBeLessThanOrEqual(Math.max(...wpAlts) + 5);
+    // Safety property: from any point on the path, returning home at max(current altitude, RTH
+    // altitude) in a straight line clears the treetops by the minimum clearance (checked on the slope
+    // surface, which is exact here up to the 30 m safety radius).
+    const R = p.terrain!.rthAltM;
+    const homeE = p.terrain!.homeElevM;
+    for (const m of p.missions) {
+      const w = m.itinerary!;
+      for (let i = 0; i + 1 < w.length; i++)
+        for (let k = 0; k <= 10; k++) {
+          const t = k / 10;
+          const xy: XY = [w[i].xy[0] + (w[i + 1].xy[0] - w[i].xy[0]) * t, w[i].xy[1] + (w[i + 1].xy[1] - w[i].xy[1]) * t];
+          const alt = Math.max(w[i].alt + (w[i + 1].alt - w[i].alt) * t, R);
+          for (let q = 0; q <= 20; q++) {
+            const pp: XY = [xy[0] + ((p.homeXY[0] - xy[0]) * q) / 20, xy[1] + ((p.homeXY[1] - xy[1]) * q) / 20];
+            const treetop = 100 + 0.3 * pp[1] + 30;
+            expect(homeE + alt - treetop).toBeGreaterThanOrEqual(30 - 1e-6);
+          }
+        }
+    }
   });
 
   it('CSV carries the climb waypoint and per-waypoint altitudes; photos stop at each line end', () => {
