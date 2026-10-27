@@ -182,12 +182,18 @@ function ensureTerrain(now = false) {
 }
 
 let planError = '';
+/** Identifies the area and takeoff point; a flat-ground confirmation only counts for the area it was given for. */
+function areaKey(): string {
+  return JSON.stringify([state.polygon.map((p) => p.map((v) => +v.toFixed(5))), state.home?.map((v) => +v.toFixed(5))]);
+}
+
 function recompute() {
   planError = '';
   plan = null;
   if (state.polygon.length < 3 || !state.home) return;
   try {
-    plan = buildPlan({ ...state.settings, polygon: state.polygon, home: state.home }, terrain);
+    const flat = state.settings.flatGroundConfirmed && state.settings.flatConfirmedFor === areaKey();
+    plan = buildPlan({ ...state.settings, flatGroundConfirmed: flat, polygon: state.polygon, home: state.home }, terrain);
   } catch (e) {
     planError = e instanceof PlanError ? e.message : `Planning failed: ${(e as Error).message}`;
     console.error('[dronecraft] planning failed', e);
@@ -464,6 +470,7 @@ function refreshMarkers() {
 }
 
 let startMarkers: Marker[] = [];
+let steepMarker: Marker | null = null;
 
 function setData(id: string, data: any) {
   (map.getSource(id) as GeoJSONSource | undefined)?.setData(data);
@@ -496,6 +503,16 @@ function refreshMap() {
   setData('arrows', g.arrows);
   setData('photos', g.photos);
   setData('transit', state.home ? g.transit : empty);
+  steepMarker?.remove();
+  steepMarker = null;
+  const t = plan?.terrain;
+  if (t && t.maxSlope > 1) {
+    const el = document.createElement('div');
+    el.className = 'steep-pin';
+    el.textContent = '!';
+    el.title = `Steepest ground: ${Math.round(t.maxSlope * 100)}% slope. Likely cliff or rock formation.`;
+    steepMarker = new Marker({ element: el }).setLngLat(t.maxSlopeAt).addTo(map);
+  }
   if (state.home) {
     for (const s of g.starts) {
       const el = document.createElement('div');
@@ -641,6 +658,7 @@ function renderStep() {
         ${slider('altitudeM', 'Height above trees', 30, 120, 1, 'm', 'Height above the treetops. Sets photo resolution, overlap and clearance. With elevation loaded the drone follows the terrain to hold this height. 80 to 100 m is a sensible start over tall canopy.')}
         ${slider('canopyM', 'Tree height', 0, 70, 1, 'm', 'Added to ground elevation to estimate the treetops. Use the tallest trees, not the average. Lowland Sumatran forest has emergents of 50 to 60 m. Set 0 for open ground.')}
         ${slider('minClearanceM', 'Minimum clearance', 10, 60, 1, 'm', 'Smallest allowed gap between the drone and the estimated treetops anywhere on the path. The Air 2S cannot sense obstacles to the side, so keep a margin for trees taller than you allowed for.')}
+        ${slider('obstacleFloorM', 'Highest obstacle above takeoff', 0, 400, 5, 'm', 'The tallest rock formation or tree top in or near the area, in metres above your takeoff point. Required where the app detects cliffs or rock towers, because the elevation data cannot see formations narrower than about 60 m. Measure it: climb straight up over takeoff until you are clearly above the tallest top and read the altitude in DJI Fly. 0 = not set.')}
         ${slider('frontOverlap', 'Front overlap', 0.6, 0.9, 0.01, '%', 'How much each photo overlaps the next along a line. 80% suits forest, where leaves move and texture repeats.')}
         ${slider('sideOverlap', 'Side overlap', 0.6, 0.9, 0.01, '%', 'How much neighbouring lines overlap. Sets line spacing exactly. 80% for forest.')}
         ${slider('speedMs', 'Speed', 2, 12, 0.5, 'm/s', 'Ground speed on mapping lines. Slower is smoother and gives sharper photos. The Air 2S needs at least 2 s between photos, so too fast turns the interval check red.')}
@@ -656,7 +674,8 @@ function renderStep() {
         ${slider('batteryMin', 'Battery flight time', 15, 31, 1, 'min', 'Usable time per battery. The Air 2S is rated 31 min in still air; 27 is realistic for mapping.')}
         ${slider('reservePct', 'Battery reserve', 0.15, 0.4, 0.01, '%', 'Kept in hand for wind, the return leg and landing. 30% is a safe default in hills.')}
         ${slider('maxRangeM', 'Max distance from takeoff', 200, 3000, 50, 'm', 'Virtual stick needs the link the whole time. In hills and forest, keep this short enough for line of sight.')}
-        ${slider('maxAltitudeM', 'Max altitude', 60, 500, 10, 'm', 'Legal ceiling. 120 m in Australia and Indonesia for normal operations.')}
+        ${slider('maxAltitudeM', 'Legal height limit', 60, 500, 10, 'm', 'Legal ceiling above the ground below the drone. 120 m in Australia and Indonesia for normal operations.')}
+        ${slider('droneMaxAltM', 'DJI Fly max altitude', 20, 500, 10, 'm', 'The max altitude set in DJI Fly (Safety settings). The drone will not climb above it, even mid-mission, so it must be at least as high as the highest waypoint and the RTH altitude. Set the same in Litchi.')}
         <div class="row" style="margin-top:16px"><button class="btn" id="resetsettings">Reset settings to defaults</button></div>
         <p class="hint">Resets flight settings and limits only. The area and takeoff point stay as they are.</p>`;
       bindSliders();
@@ -720,7 +739,7 @@ function renderStep() {
         ${
           p.terrain
             ? ''
-            : `<label class="checkbox"><input type="checkbox" id="flat" ${state.settings.flatGroundConfirmed ? 'checked' : ''}>
+            : `<label class="checkbox"><input type="checkbox" id="flat" ${p.input.flatGroundConfirmed ? 'checked' : ''}>
           <span>This site is flat. Plan without elevation data, with altitudes constant above takeoff.</span></label>`
         }
         <label class="checkbox"><input type="checkbox" id="geo" ${state.settings.geoZoneChecked ? 'checked' : ''}>
@@ -728,6 +747,7 @@ function renderStep() {
         <div class="row"><button class="btn primary" id="next" ${p.exportBlocked ? 'disabled' : ''}>Next: export</button></div>`;
       ($body.querySelector('#flat') as HTMLInputElement | null)?.addEventListener('change', (e) => {
         state.settings.flatGroundConfirmed = (e.target as HTMLInputElement).checked;
+        state.settings.flatConfirmedFor = areaKey();
         update();
       });
       ($body.querySelector('#geo') as HTMLInputElement).addEventListener('change', (e) => {
@@ -759,8 +779,17 @@ function renderStep() {
             <li>Heading mode: <b>Toward next waypoint</b> (Auto)</li>
             <li>Mission photo interval, time and distance: <b>off</b>. Waypoints without photos are written as "use mission setting", so a mission interval would add photos on turns and transit.</li>
             <li>Keep altitudes relative to takeoff; do not switch on "Above ground".</li>
-            ${p.terrain ? `<li>In DJI Fly, set RTH altitude to at least <b>${p.terrain.rthAltM} m</b>.</li>` : ''}
           </ul></div>
+        <div class="banner fail"><b>Before every flight, in DJI Fly</b>:
+          <ul>
+            ${p.terrain ? `<li>RTH altitude at least <b>${p.terrain.rthAltM} m</b>.</li>` : ''}
+            <li>Max altitude at least <b>${Math.ceil(Math.max(p.terrain?.rthAltM ?? 0, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m</b> (and the same in Litchi). The drone will not climb past it.</li>
+            <li>Signal lost action: <b>RTH</b>, not hover.</li>
+            <li>If DJI Fly offers an RTH path option (Optimal / Preset), choose <b>Preset</b> so it climbs to RTH altitude before flying home.</li>
+          </ul>
+          <b>Takeoff</b>: launch at the planned takeoff point, never lower. Altitudes are measured from where the drone takes off; launching 10 m lower puts the whole flight 10 m closer to the rocks.<br>
+          <b>Resuming after a battery swap</b>: do not start straight from the stopped waypoint, because Litchi flies a straight line to it that nothing has checked. Climb over takeoff to the RTH altitude, fly at that altitude until you are directly above the stopped waypoint, then start the mission from that waypoint.<br>
+          Obstacle avoidance does not work during Litchi missions. Keep the drone in sight near rock faces.</div>
         ${p.missions
           .map(
             (m, i) => `
@@ -1102,8 +1131,10 @@ function reportFile(): File {
     `SD card has room for ${p.photoCount} photos (about ${((p.photoCount * 9) / 1024).toFixed(1)} GB)`,
     `${p.missions.length} batteries charged`,
     ...(p.terrain ? [`RTH altitude in DJI Fly set to at least ${p.terrain.rthAltM} m`] : []),
-    'Launch from the planned takeoff point, GPS locked, line of sight to the far corner',
-    'If a mission stops: note the waypoint, swap battery, restart the mission from that waypoint',
+    'Launch from the planned takeoff point, never lower, GPS locked, line of sight to the far corner',
+    `DJI Fly: max altitude at least ${Math.ceil(Math.max(p.terrain?.rthAltM ?? 0, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m (same in Litchi), signal lost action RTH, RTH path Preset if offered`,
+    'If a mission stops: note the waypoint, swap battery, climb over takeoff to RTH altitude, fly at that altitude to directly above the stopped waypoint, then start from that waypoint',
+    'Obstacle avoidance is off during Litchi missions; keep the drone in sight near rock faces',
   ].forEach((t) => L.push(`  [ ] ${t}`));
   return new File([L.join('\n') + '\n'], `${slug()}-report.txt`, { type: 'text/plain' });
 }

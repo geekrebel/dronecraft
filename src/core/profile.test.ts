@@ -66,17 +66,21 @@ describe('buildPlan with terrain', () => {
   const slope = new FunctionTerrain((p) => 100 + 0.3 * proj.toLocal(p)[1]);
   const input = { ...DEFAULT_INPUT, polygon: poly, home, altitudeM: 80, canopyM: 30, minClearanceM: 30 };
 
-  it('waypoint altitudes are height above trees + tree height + ground rise relative to takeoff', () => {
+  it('waypoint altitudes follow the slope, erring high: highest ground within 30 m, lowest takeoff within 30 m', () => {
     const p = buildPlan(input, slope);
     expect(p.terrainStatus).toBe('loaded');
-    const homeElev = 100 + 0.3 * -180;
-    expect(p.terrain!.homeElevM).toBeCloseTo(homeElev, 6);
+    const homeTrue = 100 + 0.3 * -180;
+    // Lowest ground within 30 m of takeoff on a 0.3 slope is 9 m below it.
+    expect(p.terrain!.homeElevM).toBeCloseTo(homeTrue - 9, 6);
     for (const m of p.missions)
       for (const l of m.lines)
         for (const w of l.wps!) {
           const y = at(l, w.t)[1];
-          const expected = 100 + 0.3 * y + 30 + 80 - homeElev;
-          expect(Math.abs(w.alt - expected)).toBeLessThanOrEqual(TERRAIN_TOL_M);
+          const exact = 100 + 0.3 * y + 30 + 80 - homeTrue;
+          // Never below the exact terrain-following altitude (less the 5 m tolerance), and at most
+          // 9 m (obstacle radius) + 9 m (takeoff radius) above it.
+          expect(w.alt).toBeGreaterThanOrEqual(exact - TERRAIN_TOL_M);
+          expect(w.alt).toBeLessThanOrEqual(exact + 18 + TERRAIN_TOL_M);
         }
   });
 
@@ -132,11 +136,15 @@ describe('buildPlan with terrain', () => {
     expect(m.itinerary!.filter((w) => w.kind === 'lineEnd').every((w) => !w.photo)).toBe(true);
   });
 
-  it('steep terrain trips the climb-rate check', () => {
+  it('steep terrain: profiles are climb-limited, and export is blocked until an obstacle height is measured', () => {
     const steep = new FunctionTerrain((p) => 100 + 1.2 * proj.toLocal(p)[1]);
-    const p = buildPlan({ ...input, gridAngleDeg: 90, speedMs: 5 }, steep);
-    expect(p.maxVerticalMs).toBeGreaterThan(4);
-    expect(p.checks.find((c) => c.id === 'climb')!.status).toBe('fail');
+    const p = buildPlan({ ...input, gridAngleDeg: 90, speedMs: 5, droneMaxAltM: 500, maxAltitudeM: 500 }, steep);
+    expect(p.maxVerticalMs).toBeLessThanOrEqual(3);
+    expect(p.checks.find((c) => c.id === 'steep')!.status).toBe('fail');
+    expect(p.exportBlocked).toBe(true);
+    const withFloor = buildPlan({ ...input, gridAngleDeg: 90, speedMs: 5, droneMaxAltM: 500, maxAltitudeM: 500, obstacleFloorM: 400 }, steep);
+    expect(withFloor.checks.find((c) => c.id === 'steep')!.status).toBe('caution');
+    for (const m of withFloor.missions) for (const w of m.itinerary!) expect(w.alt).toBeGreaterThanOrEqual(400 + 30 - TERRAIN_TOL_M);
   });
 
   it('partial coverage falls back to flat planning and says so', () => {

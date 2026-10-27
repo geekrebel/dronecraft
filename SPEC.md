@@ -63,6 +63,15 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[MVP]** Each mission starts at the end nearest home.
 - **[v1]** Takeoff-point variants: generate the full mission set for up to three alternative takeoff points in one export.
 
+### 3.4a Rock formations and elevation-data limits (adversarial review, 27 Oct 2026)
+- **[done]** Conservative terrain model: obstacles = highest DEM value within 30 m; takeoff = lowest within 30 m.
+- **[done]** Terrain following climbs before rock faces (profile limited to 2.5 m/s vertical) and never dips more than 1 m below target.
+- **[done]** Steep-terrain detection (DEM slope > 100% over 20 m) blocks export until the user enters a field-measured "Highest obstacle above takeoff"; that value becomes a floor (plus minimum clearance) for the flight and RTH. Steepest point marked on the map.
+- **[done]** DJI Fly max altitude setting; export blocked when a waypoint or RTH needs more.
+- **[done]** Flat-ground confirmation only counts for the area it was given for.
+- **[done]** Export screen and report: DJI Fly settings, takeoff rule, safe resume procedure, no obstacle avoidance in Litchi missions.
+- `src/core/adversarial.test.ts`: six rock scenarios (tower, sub-resolution spire, cliff, valley takeoff, misregistered DEM, tower cluster) evaluated against the true surface with a simulated 30 m SRTM.
+
 ### 3.5a Itinerary
 - **[MVP, done]** One exported itinerary per mission (climb over takeoff, transit at 10 m/s with photos off, mapping lines with intermediate terrain waypoints, turns) drives the battery estimate, safety checks, Litchi CSV and KML.
 - **[MVP, done]** Legs longer than 1500 m are subdivided (Litchi accepts 0.6 to 1999 m).

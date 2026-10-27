@@ -13,6 +13,7 @@ import {
   legExtremes,
 } from './itinerary';
 import type { Terrain } from './terrain';
+import { SAFETY_RADIUS_M, STEEP_SLOPE, SafeTerrain } from './safety';
 
 export interface PlanInput {
   polygon: LngLat[];
@@ -38,6 +39,15 @@ export interface PlanInput {
   geoZoneChecked: boolean;
   /** The user confirms the site is flat, so planning without elevation data is acceptable. */
   flatGroundConfirmed: boolean;
+  /** Which area the flat-ground confirmation was given for (set by the app). */
+  flatConfirmedFor: string;
+  /**
+   * Highest rock or tree top in or near the area, metres above takeoff, measured in the field.
+   * 0 = not set. When set, no part of the flight or RTH goes below this plus the minimum clearance.
+   */
+  obstacleFloorM: number;
+  /** Max altitude set in DJI Fly; the aircraft will not climb above it. */
+  droneMaxAltM: number;
 }
 
 export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
@@ -57,7 +67,13 @@ export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
   maxAltitudeM: 120,
   geoZoneChecked: false,
   flatGroundConfirmed: false,
+  flatConfirmedFor: '',
+  obstacleFloorM: 0,
+  droneMaxAltM: 120,
 };
+
+/** Vertical speed terrain following is designed for, m/s. Below the 3 m/s caution level. */
+export const TERRAIN_VERTICAL_MS = 2.5;
 
 /** Accepted range for each numeric setting. Imports outside these are rejected; the planner refuses them too. */
 export const SETTING_RANGES: Record<string, [number, number]> = {
@@ -74,6 +90,8 @@ export const SETTING_RANGES: Record<string, [number, number]> = {
   reservePct: [0.1, 0.6],
   maxRangeM: [100, 5000],
   maxAltitudeM: [30, 500],
+  obstacleFloorM: [0, 500],
+  droneMaxAltM: [20, 500],
 };
 
 /** Planning refuses inputs it cannot handle safely; the message is meant for the user. */
@@ -86,7 +104,7 @@ export const MAX_LINES = 2000;
 export const LITCHI_MAX_ALT_M = 500;
 export const LITCHI_MAX_INTERVAL = 100;
 /** Vertical speed the climb-out leg is designed for, m/s. */
-export const CLIMB_OUT_VERTICAL_MS = 3;
+export const CLIMB_OUT_VERTICAL_MS = 2.5;
 export const RETURN_SPEED_MS = 10;
 
 const okLngLat = (p: unknown): p is LngLat =>
@@ -116,6 +134,10 @@ export interface TerrainSummary {
   maxGroundM: number;
   /** Recommended DJI RTH altitude above takeoff. */
   rthAltM: number;
+  /** Steepest elevation-data slope near the plan (rise per metre). */
+  maxSlope: number;
+  /** Where it is. */
+  maxSlopeAt: LngLat;
 }
 
 export type CheckStatus = 'pass' | 'caution' | 'fail';
@@ -187,9 +209,23 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     if (h === null) throw new MissingElevation();
     return h;
   };
-  const surface = (xy: XY) => ground(xy) + input.canopyM;
-  const homeElev = ground(home);
-  const target = (xy: XY) => surface(xy) + input.altitudeM - homeElev;
+  // Conservative model (see safety.ts): highest ground within 30 m for obstacles, lowest within
+  // 30 m for takeoff, so elevation-data errors push the drone up, not down.
+  let safe: SafeTerrain | null = null;
+  if (terrain) {
+    const xs = [...ring.map((p) => p[0]), home[0]];
+    const ys = [...ring.map((p) => p[1]), home[1]];
+    const m = input.bufferM + SAFETY_RADIUS_M + 40;
+    safe = new SafeTerrain(ground, { x0: Math.min(...xs) - m, y0: Math.min(...ys) - m, x1: Math.max(...xs) + m, y1: Math.max(...ys) + m });
+  }
+  const obstacle = (xy: XY) => (safe ? safe.obstacle(xy) : 0);
+  const homeElev = safe ? safe.lowest(home) : 0;
+  // Field-measured highest obstacle (absolute), when given. It sets a minimum for the whole flight
+  // and RTH (obstacle + minimum clearance); mapping height still follows the terrain where higher.
+  const floorAbs = input.obstacleFloorM > 0 ? homeElev + input.obstacleFloorM : -Infinity;
+  const treetops = (xy: XY) => obstacle(xy) + input.canopyM;
+  const surface = (xy: XY) => Math.max(treetops(xy), floorAbs);
+  const target = (xy: XY) => Math.max(treetops(xy) + input.altitudeM, floorAbs + input.minClearanceM) - homeElev;
 
   const ls = lineSpacing(camera, input.altitudeM, input.sideOverlap);
   const ps = photoSpacing(camera, input.altitudeM, input.frontOverlap);
@@ -198,7 +234,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   const worst =
     input.trigger === 'time' ? overlapForSpacing(camera, input.altitudeM, ps * 1.2) : input.frontOverlap;
 
-  const profile = (l: Line) => profileLine(l, target, TERRAIN_TOL_M, TERRAIN_STEP_M);
+  const profile = (l: Line) => profileLine(l, target, TERRAIN_TOL_M, TERRAIN_STEP_M, TERRAIN_VERTICAL_MS / input.speedMs);
   const rawLines = generateLines(ring, ls, angleDeg, input.bufferM);
   if (rawLines.length > MAX_LINES) throw new PlanError(`This needs ${rawLines.length} flight lines. Reduce the area or raise the altitude.`);
   const lines = rawLines.map((l) => ({ ...l, wps: profile(l) }));
@@ -279,6 +315,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
       }
     }
   }
+  if (!terrain && input.obstacleFloorM > 0) rthNeed = input.obstacleFloorM + input.minClearanceM;
   if (terrain && rthNeed > -Infinity) {
     // Re-time each mission with the RTH climb included.
     const rthAltM = Math.ceil(rthNeed / 5) * 5;
@@ -302,6 +339,8 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
       minGroundM: lo,
       maxGroundM: hi,
       rthAltM: Math.ceil(rthNeed / 5) * 5,
+      maxSlope: safe!.maxSlope,
+      maxSlopeAt: proj.toLngLat(safe!.maxSlopeAt),
     };
   }
 
@@ -481,6 +520,35 @@ export function runChecks(a: {
       label: 'Return-to-home altitude',
       status: a.terrain.rthAltM > input.maxAltitudeM ? 'caution' : 'pass',
       detail: `Set RTH altitude in DJI Fly to at least ${a.terrain.rthAltM} m. That clears the treetops by ${input.minClearanceM} m on a straight line home from any point on the path, checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
+    });
+  }
+
+  if (a.terrain && a.terrain.maxSlope > STEEP_SLOPE) {
+    const pct = Math.round(a.terrain.maxSlope * 100);
+    out.push({
+      id: 'steep',
+      label: 'Steep rock formations',
+      status: input.obstacleFloorM > 0 ? 'caution' : 'fail',
+      detail:
+        `The elevation data has slopes up to ${pct}% here, which usually means cliffs or rock towers. ` +
+        'SRTM elevation is averaged over 30 m, so towers and spires narrower than about 60 m appear much lower than they are and terrain following cannot see them. ' +
+        (input.obstacleFloorM > 0
+          ? `You set the highest obstacle to ${input.obstacleFloorM} m above takeoff, so nothing in the flight or RTH goes below ${input.obstacleFloorM + input.minClearanceM} m above takeoff. That is only as safe as that measurement.`
+          : 'Export is blocked until you set "Highest obstacle above takeoff" in Settings. Measure it on site: climb straight up over takeoff until you are clearly above the tallest formation and treetops, and read the altitude in DJI Fly.'),
+    });
+  }
+
+  {
+    const top = Math.max(a.maxAlt, a.terrain?.rthAltM ?? -Infinity, input.obstacleFloorM > 0 ? input.obstacleFloorM + input.minClearanceM : -Infinity);
+    out.push({
+      id: 'djilimit',
+      label: 'DJI altitude limit',
+      status: top > input.droneMaxAltM ? 'fail' : top > input.droneMaxAltM - 10 ? 'caution' : 'pass',
+      detail:
+        `Highest point the plan or RTH needs: ${top.toFixed(0)} m above takeoff. Your DJI Fly max altitude: ${input.droneMaxAltM} m. ` +
+        (top > input.droneMaxAltM
+          ? 'The drone will stop climbing at the DJI limit and fly level into anything taller. Raise the max altitude in DJI Fly (and Litchi) and update it in Settings, or launch from higher ground.'
+          : 'The aircraft cannot climb above that limit, so keep it at least this high in DJI Fly and in Litchi.'),
     });
   }
 

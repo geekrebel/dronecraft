@@ -13,24 +13,30 @@ export interface LineWp {
 
 export const at = (l: Line, t: number): XY => [l.start[0] + (l.end[0] - l.start[0]) * t, l.start[1] + (l.end[1] - l.start[1]) * t];
 
+export const BELOW_TOL_M = 1;
+
 /**
  * Waypoints along `l` whose straight-line altitude interpolation stays within `tolM` of
  * `target(xy)` at every sample (every `stepM`). Always includes both ends.
  * Greedy split at the worst sample (Douglas-Peucker on the altitude profile).
  */
-export function profileLine(l: Line, target: (xy: XY) => number, tolM = 5, stepM = 10): LineWp[] {
+export function profileLine(l: Line, target: (xy: XY) => number, tolM = 5, stepM = 10, maxGradient = Infinity): LineWp[] {
   const len = dist(l.start, l.end);
   const n = Math.max(1, Math.ceil(len / stepM));
   const ts = Array.from({ length: n + 1 }, (_, i) => i / n);
   const zs = ts.map((t) => target(at(l, t)));
+  if (Number.isFinite(maxGradient)) climbLimit(zs, (maxGradient * len) / n);
   const keep = new Set([0, n]);
+  // One-sided: the straight leg may run up to `tolM` above the target, but at most `BELOW_TOL_M`
+  // below it, so terrain following never cuts into the planned clearance.
   const split = (a: number, b: number) => {
     let worst = -1;
-    let worstDev = tolM;
+    let worstDev = 0;
     for (let i = a + 1; i < b; i++) {
       const interp = zs[a] + ((zs[b] - zs[a]) * (ts[i] - ts[a])) / (ts[b] - ts[a]);
-      const dev = Math.abs(zs[i] - interp);
-      if (dev > worstDev) {
+      const over = interp - zs[i];
+      const dev = over >= 0 ? over / tolM : -over / BELOW_TOL_M;
+      if (dev > 1 && dev > worstDev) {
         worstDev = dev;
         worst = i;
       }
@@ -42,6 +48,16 @@ export function profileLine(l: Line, target: (xy: XY) => number, tolM = 5, stepM
   };
   split(0, n);
   return [...keep].sort((a, b) => a - b).map((i) => ({ t: ts[i], alt: zs[i] }));
+}
+
+/**
+ * Raise a sampled profile in place so no step changes by more than `maxStep`: the drone climbs
+ * before a rock face and descends after it, instead of needing to climb faster than it can.
+ * The result is the lowest profile that is at or above the input and respects the limit.
+ */
+export function climbLimit(zs: number[], maxStep: number) {
+  for (let i = 1; i < zs.length; i++) zs[i] = Math.max(zs[i], zs[i - 1] - maxStep);
+  for (let i = zs.length - 2; i >= 0; i--) zs[i] = Math.max(zs[i], zs[i + 1] - maxStep);
 }
 
 /** A 3D polyline vertex: local position and altitude above takeoff. */

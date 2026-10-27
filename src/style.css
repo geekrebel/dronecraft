@@ -137,3 +137,7 @@ button.btn.danger { background: #7f1d1d; border-color: #b91c1c; color: #fff; }
 .stats.error { color: var(--fail); }
 .savewarn { margin: 0 12px 8px; }
 .banner b { font-weight: 700; }
+.steep-pin {
+  width: 26px; height: 26px; border-radius: 50%; background: var(--fail); color: #fff; border: 2px solid #0b120e;
+  font-weight: 900; display: grid; place-items: center; box-shadow: 0 1px 4px rgba(0,0,0,0.5); pointer-events: auto;
+}
