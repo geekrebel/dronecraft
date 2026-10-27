@@ -1095,7 +1095,9 @@ function missionFile(i: number): File {
       photoIntervalS: p.photoIntervalS,
     }, p.homeXY),
   );
-  return new File([csv], `${slug()}-m${m.index}-of-${p.missions.length}.csv`, { type: 'text/csv' });
+  // The rock formation height is in the name: on site, raise all waypoints in Litchi by (measured - this).
+  const f = s.formationM > 0 ? `-f${s.formationM}` : '';
+  return new File([csv], `${slug()}${f}-m${m.index}-of-${p.missions.length}.csv`, { type: 'text/csv' });
 }
 function kmlFile(): File {
   return new File([toKml(plan!, state.name)], `${slug()}.kml`, { type: 'application/vnd.google-earth.kml+xml' });
@@ -1106,6 +1108,10 @@ function reportFile(): File {
   const L: string[] = [];
   L.push(`DroneCraft plan: ${state.name}`, `Generated ${new Date().toISOString()}`, '');
   L.push(`Takeoff: ${state.home![1].toFixed(6)}, ${state.home![0].toFixed(6)}`);
+  L.push(
+    `Rock formation height: ${s.formationM} m. If you measure taller formations on site, raise ALL waypoints in Litchi by the difference (select all, Edit, Altitude relative to "Current", +difference), and raise DJI Fly max altitude and RTH altitude by the same amount. Never lower.`,
+    `Highest obstacle above takeoff: ${s.obstacleFloorM > 0 ? `${s.obstacleFloorM} m` : 'not set'}`,
+  );
   L.push(`Height above trees: ${s.altitudeM} m (tree height ${s.canopyM} m, minimum clearance ${s.minClearanceM} m)`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
   L.push(`Speed: ${s.speedMs} m/s`, `Trigger: ${s.trigger === 'distance' ? `every ${p.photoSpacingM.toFixed(1)} m` : `every ${p.photoIntervalS.toFixed(1)} s`}`);
   L.push(`GSD: ${p.gsdCm.toFixed(2)} cm/px`, `Line spacing: ${p.lineSpacingM.toFixed(1)} m`, `Line direction: ${p.angleDeg.toFixed(0)} deg`);
