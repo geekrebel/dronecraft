@@ -9,9 +9,12 @@ import { registerSW } from 'virtual:pwa-register';
 import { DEFAULT_INPUT, Plan, PlanError, PlanInput, buildPlan } from './core/plan';
 import { LngLat, centroid } from './core/projection';
 import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } from './core/shapes';
-import { KV, PlanDoc, PlanStore, uniqueName } from './core/store';
+import { PlanDoc, PlanStore, uniqueName } from './core/store';
+import { safeStorage } from './core/storage';
+import { measurementKeys } from './core/measurements';
+import { checkTakeoffDistance, gridSize } from './core/limits';
 import { areaProblem, parsePlansFile, serializePlans } from './core/planfile';
-import { TERRAIN_ZOOM, Terrain, TileTerrain, tilesFor } from './core/terrain';
+import { TERRAIN_ZOOM, Terrain, TileKey, TileTerrain, tilesFor } from './core/terrain';
 import { hasTiles, loadTiles, loadedTiles } from './terrainLoader';
 import { makeProjection } from './core/projection';
 import { missionWaypoints, toLitchiCsv } from './core/litchi';
@@ -39,17 +42,6 @@ const DEFAULT_SQUARE_M = 200;
 const BUKIT_LAWANG: LngLat = [98.12, 3.55];
 const MISSION_COLORS = ['#d9f99d', '#67e8f9', '#f9a8d4', '#fdba74', '#c4b5fd', '#86efac', '#fde047'];
 
-function safeStorage(): KV {
-  try {
-    const k = '__dc_test__';
-    localStorage.setItem(k, '1');
-    localStorage.removeItem(k);
-    return localStorage;
-  } catch {
-    const m = new Map<string, string>();
-    return { getItem: (k) => m.get(k) ?? null, setItem: (k, v) => void m.set(k, v) };
-  }
-}
 const kv = safeStorage();
 const store = new PlanStore<Settings>(kv);
 
@@ -87,6 +79,7 @@ function load(): State {
 const state = load();
 function save() {
   store.save({ id: state.id, name: state.name, polygon: state.polygon, home: state.home, settings: state.settings, updatedAt: 0 });
+  document.getElementById('savewarn')!.hidden = store.saved;
   try {
     kv.setItem(UI_KEY, JSON.stringify({ step: state.step, basemap: state.basemap }));
   } catch {
@@ -116,10 +109,12 @@ function terrainPoints(): LngLat[] {
   const pts = [...state.polygon, ...(state.home ? [state.home] : [])];
   const p = makeProjection(pts[0]);
   const local = pts.map((q) => p.toLocal(q));
+  if (state.home) checkTakeoffDistance(p.toLocal(state.home), state.polygon.map((q) => p.toLocal(q)), state.settings.maxRangeM);
   const m = 200 + state.settings.bufferM;
   const xs = local.map((q) => q[0]);
   const ys = local.map((q) => q[1]);
   const [x0, x1, y0, y1] = [Math.min(...xs) - m, Math.max(...xs) + m, Math.min(...ys) - m, Math.max(...ys) + m];
+  gridSize({ x0, x1, y0, y1 }, 10);
   return [p.toLngLat([x0, y0]), p.toLngLat([x1, y1]), p.toLngLat([x0, y1]), p.toLngLat([x1, y0])];
 }
 
@@ -127,7 +122,18 @@ function terrainPoints(): LngLat[] {
 let failedKeys: string | null = null;
 let retryCount = 0;
 const RETRY_DELAYS_S = [5, 20, 60];
-const keysId = () => tilesFor(terrainPoints(), TERRAIN_ZOOM).map((k) => `${k.z}/${k.x}/${k.y}`).join(',');
+const keysId = (keys: TileKey[]) => keys.map((k) => `${k.z}/${k.x}/${k.y}`).join(',');
+
+/** Refuse oversized/invalid requests before enumeration or downloading, including at startup. */
+function terrainKeys(): TileKey[] | null {
+  try {
+    return tilesFor(terrainPoints(), TERRAIN_ZOOM);
+  } catch (e) {
+    terrainState = 'error';
+    terrainError = (e as Error).message;
+    return null;
+  }
+}
 
 /** Retry from scratch: used by the Retry button and when the connection comes back. */
 function retryTerrain() {
@@ -140,9 +146,10 @@ function retryTerrain() {
 function ensureTerrain(now = false) {
   clearTimeout(terrainTimer);
   const run = async () => {
-    const keys = tilesFor(terrainPoints(), TERRAIN_ZOOM);
+    const keys = terrainKeys();
+    if (!keys) { render(); return; }
     if (!keys.length) return;
-    const id = keysId();
+    const id = keysId(keys);
     if (hasTiles(keys)) {
       if (terrainState !== 'ready' || !terrain) {
         terrain = new TileTerrain(loadedTiles(), TERRAIN_ZOOM);
@@ -658,8 +665,8 @@ function renderStep() {
         ${slider('altitudeM', 'Height above trees', 30, 120, 1, 'm', 'Height above the treetops. Sets photo resolution, overlap and clearance. With elevation loaded the drone follows the terrain to hold this height. 80 to 100 m is a sensible start over tall canopy.')}
         ${slider('canopyM', 'Tree height', 0, 70, 1, 'm', 'Added to ground elevation to estimate the treetops. Use the tallest trees, not the average. Lowland Sumatran forest has emergents of 50 to 60 m. Set 0 for open ground.')}
         ${slider('minClearanceM', 'Minimum clearance', 10, 60, 1, 'm', 'Smallest allowed gap between the drone and the estimated treetops anywhere on the path. The Air 2S cannot sense obstacles to the side, so keep a margin for trees taller than you allowed for.')}
-        ${slider('formationM', 'Rock formation height', 0, 300, 5, 'm', 'How far the tallest rock tower or cliff rises above the ground around it. Added to the elevation data everywhere, so the drone still follows the terrain but stays clear of formations the data cannot see (anything narrower than about 60 m). Measure it: hover level with the base of the tallest formation, climb until level with its top, and take the difference in DJI Fly altitude. 0 = not set.')}
-        ${slider('obstacleFloorM', 'Highest obstacle above takeoff', 0, 400, 5, 'm', 'The tallest rock formation or tree top in or near the area, in metres above your takeoff point. Required where the app detects cliffs or rock towers, because the elevation data cannot see formations narrower than about 60 m. Measure it: climb straight up over takeoff until you are clearly above the tallest top and read the altitude in DJI Fly. 0 = not set.')}
+        ${slider('formationM', 'Rock formation height', 0, 300, 5, 'm', 'How far the tallest rock tower or cliff rises above the ground around it. Added to the elevation data everywhere, so the drone still follows the terrain but stays clear of formations the data cannot see (anything narrower than about 60 m). Measure it: hover level with the base of the tallest formation, climb until level with its top, and take the difference in DJI Fly altitude. 0 = not set.')}${measurementConfirmation('formationM')}
+        ${slider('obstacleFloorM', 'Highest obstacle above takeoff', 0, 400, 5, 'm', 'The tallest rock formation or tree top in or near the area, in metres above your takeoff point. Required where the app detects cliffs or rock towers, because the elevation data cannot see formations narrower than about 60 m. Measure it: climb straight up over takeoff until you are clearly above the tallest top and read the altitude in DJI Fly. 0 = not set.')}${measurementConfirmation('obstacleFloorM')}
         ${slider('frontOverlap', 'Front overlap', 0.6, 0.9, 0.01, '%', 'How much each photo overlaps the next along a line. 80% suits forest, where leaves move and texture repeats.')}
         ${slider('sideOverlap', 'Side overlap', 0.6, 0.9, 0.01, '%', 'How much neighbouring lines overlap. Sets line spacing exactly. 80% for forest.')}
         ${slider('speedMs', 'Speed', 2, 12, 0.5, 'm/s', 'Ground speed on mapping lines. Slower is smoother and gives sharper photos. The Air 2S needs at least 2 s between photos, so too fast turns the interval check red.')}
@@ -680,6 +687,12 @@ function renderStep() {
         <div class="row" style="margin-top:16px"><button class="btn" id="resetsettings">Reset settings to defaults</button></div>
         <p class="hint">Resets flight settings and limits only. The area and takeoff point stay as they are.</p>`;
       bindSliders();
+      $body.querySelectorAll<HTMLElement>('[data-confirm-measurement]').forEach((b) => b.addEventListener('click', () => {
+        const key = b.dataset.confirmMeasurement as 'obstacleFloorM' | 'formationM';
+        const context = key === 'obstacleFloorM' ? 'obstacleMeasuredFor' : 'formationMeasuredFor';
+        state.settings[context] = measurementKeys(state.polygon, state.home)[context];
+        update();
+      }));
       on('resetsettings', () => {
         state.settings = { ...DEFAULT_INPUT, geoZoneChecked: state.settings.geoZoneChecked };
         update();
@@ -716,8 +729,8 @@ function renderStep() {
         ${p.exportBlocked ? `<div class="banner fail">Export is blocked until the red items are fixed.</div>` : ''}
         ${terrainBanner(p)}
         <dl class="kv">
-          <dt>Ground resolution</dt><dd>${p.gsdCm.toFixed(2)} cm/px</dd>
-          <dt>Photo footprint</dt><dd>${p.footprint.across.toFixed(0)} × ${p.footprint.along.toFixed(0)} m</dd>
+          <dt>Ground resolution (target)</dt><dd>${p.gsdCm.toFixed(2)} cm/px</dd>
+          <dt>Photo footprint (target)</dt><dd>${p.footprint.across.toFixed(0)} × ${p.footprint.along.toFixed(0)} m</dd>
           <dt>Line spacing</dt><dd>${p.lineSpacingM.toFixed(1)} m</dd>
           <dt>Photo spacing</dt><dd>${p.photoSpacingM.toFixed(1)} m (${p.photoIntervalS.toFixed(1)} s)</dd>
           <dt>Line direction</dt><dd>${p.angleDeg.toFixed(0)}°</dd>
@@ -826,6 +839,13 @@ function renderStep() {
   }
 }
 
+function measurementConfirmation(key: 'obstacleFloorM' | 'formationM'): string {
+  const context = key === 'obstacleFloorM' ? 'obstacleMeasuredFor' : 'formationMeasuredFor';
+  if (state.settings[key] === 0 || state.settings[context] === measurementKeys(state.polygon, state.home)[context]) return '';
+  return `<div class="banner caution">This height needs a new measurement for the current ${key === 'obstacleFloorM' ? 'area and takeoff point' : 'area'}. Enter the measured height above, or confirm after remeasuring.
+    <button class="btn" data-confirm-measurement="${key}" ${state.home ? '' : 'disabled'}>I remeasured: confirm this height</button></div>`;
+}
+
 function slider(key: keyof Settings, label: string, min: number, max: number, step: number, unit: string, help: string) {
   const v = state.settings[key] as number;
   const pct = unit === '%';
@@ -841,6 +861,10 @@ function bindSliders() {
     el.addEventListener('input', () => {
       const key = el.dataset.key as keyof Settings;
       (state.settings as any)[key] = Number(el.value);
+      if (key === 'obstacleFloorM' || key === 'formationM') {
+        const context = key === 'obstacleFloorM' ? 'obstacleMeasuredFor' : 'formationMeasuredFor';
+        state.settings[context] = measurementKeys(state.polygon, state.home)[context];
+      }
       document.getElementById(`v-${key}`)!.textContent = fmtVal(Number(el.value), el.dataset.unit!);
       recompute();
       save();
@@ -848,6 +872,9 @@ function bindSliders() {
       renderStats();
       renderSteps();
     }),
+  );
+  $body.querySelectorAll<HTMLInputElement>('#s-obstacleFloorM, #s-formationM').forEach((el) =>
+    el.addEventListener('change', renderStep),
   );
 }
 
@@ -1023,12 +1050,10 @@ function update() {
   refreshMarkers();
   refreshMap();
   render();
-  if (
-    state.polygon.length >= 3 &&
-    terrainState !== 'loading' &&
-    !hasTiles(tilesFor(terrainPoints(), TERRAIN_ZOOM)) &&
-    keysId() !== failedKeys
-  ) {
+  if (state.polygon.length < 3 || planError || terrainState === 'loading') return;
+  const keys = terrainKeys();
+  if (!keys) { render(); return; }
+  if (!hasTiles(keys) && keysId(keys) !== failedKeys) {
     // A different area from the one that failed: start fresh.
     if (terrainState === 'error') retryCount = 0;
     ensureTerrain();
@@ -1108,7 +1133,7 @@ function reportFile(): File {
   L.push(`Takeoff: ${state.home![1].toFixed(6)}, ${state.home![0].toFixed(6)}`);
   L.push(`Height above trees: ${s.altitudeM} m (tree height ${s.canopyM} m, minimum clearance ${s.minClearanceM} m)`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
   L.push(`Speed: ${s.speedMs} m/s`, `Trigger: ${s.trigger === 'distance' ? `every ${p.photoSpacingM.toFixed(1)} m` : `every ${p.photoIntervalS.toFixed(1)} s`}`);
-  L.push(`GSD: ${p.gsdCm.toFixed(2)} cm/px`, `Line spacing: ${p.lineSpacingM.toFixed(1)} m`, `Line direction: ${p.angleDeg.toFixed(0)} deg`);
+  L.push(`Target GSD: ${p.gsdCm.toFixed(2)} cm/px`, `Line spacing: ${p.lineSpacingM.toFixed(1)} m`, `Line direction: ${p.angleDeg.toFixed(0)} deg`);
   L.push(`Photos (approx): ${p.photoCount}`, `Total flight time: ${mmss(p.totalTimeS)}`);
   if (p.terrain) {
     L.push(`Elevation: ${p.terrain.source}`, `Takeoff elevation: ${p.terrain.homeElevM.toFixed(0)} m, ground under lines ${p.terrain.minGroundM.toFixed(0)} to ${p.terrain.maxGroundM.toFixed(0)} m`);

@@ -14,6 +14,9 @@ import {
 } from './itinerary';
 import type { Terrain } from './terrain';
 import { SAFETY_RADIUS_M, STEEP_SLOPE, SafeTerrain } from './safety';
+import { PlanError, checkTakeoffDistance } from './limits';
+import { staleMeasurements } from './measurements';
+export { PlanError } from './limits';
 
 export interface PlanInput {
   polygon: LngLat[];
@@ -46,11 +49,15 @@ export interface PlanInput {
    * 0 = not set. When set, no part of the flight or RTH goes below this plus the minimum clearance.
    */
   obstacleFloorM: number;
+  /** Geometry for which this relative height was measured and confirmed. */
+  obstacleMeasuredFor: string;
   /**
    * How far the tallest rock formation rises above the ground around it, metres. Added to the
    * elevation data everywhere (the data cannot say where narrow formations are). 0 = not set.
    */
   formationM: number;
+  /** Surveyed area for which formation height was measured and confirmed. */
+  formationMeasuredFor: string;
   /** Max altitude set in DJI Fly; the aircraft will not climb above it. */
   droneMaxAltM: number;
 }
@@ -74,7 +81,9 @@ export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
   flatGroundConfirmed: false,
   flatConfirmedFor: '',
   obstacleFloorM: 0,
+  obstacleMeasuredFor: '',
   formationM: 0,
+  formationMeasuredFor: '',
   droneMaxAltM: 120,
 };
 
@@ -101,14 +110,12 @@ export const SETTING_RANGES: Record<string, [number, number]> = {
   droneMaxAltM: [20, 500],
 };
 
-/** Planning refuses inputs it cannot handle safely; the message is meant for the user. */
-export class PlanError extends Error {}
-
 export const MAX_AREA_HA = 2000;
 export const MAX_LINES = 2000;
 
 /** Litchi limits the plan must respect (flylitchi.com/help#waypoint, legacy Hub importer). */
 export const LITCHI_MAX_ALT_M = 500;
+export const LITCHI_MIN_ALT_M = -200;
 export const LITCHI_MAX_INTERVAL = 100;
 /** Vertical speed the climb-out leg is designed for, m/s. */
 export const CLIMB_OUT_VERTICAL_MS = 2.5;
@@ -137,6 +144,8 @@ export const TERRAIN_STEP_M = 10;
 export interface TerrainSummary {
   source: string;
   homeElevM: number;
+  /** Lower takeoff reference used to design clearance, not to reconstruct actual flight height. */
+  clearanceHomeElevM: number;
   minGroundM: number;
   maxGroundM: number;
   /** Recommended DJI RTH altitude above takeoff. */
@@ -208,6 +217,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   const areaHa = ringArea(ring) / 10000;
   if (areaHa < 0.01) throw new PlanError('The area is too small or its corners are in a line.');
   if (areaHa > MAX_AREA_HA) throw new PlanError(`The area is ${areaHa.toFixed(0)} ha. DroneCraft plans up to ${MAX_AREA_HA} ha at a time; split it into smaller areas.`);
+  const homeToPolygonM = checkTakeoffDistance(home, ring, input.maxRangeM);
 
   // Surfaces in absolute metres. Without terrain, ground is flat at 0 and takeoff is at 0.
   const ground = (xy: XY): number => {
@@ -226,13 +236,16 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     safe = new SafeTerrain(ground, { x0: Math.min(...xs) - m, y0: Math.min(...ys) - m, x1: Math.max(...xs) + m, y1: Math.max(...ys) + m });
   }
   const obstacle = (xy: XY) => (safe ? safe.obstacle(xy) : 0);
-  const homeElev = safe ? safe.lowest(home) : 0;
+  const clearanceHomeElev = safe ? safe.lowest(home) : 0;
+  // CSV altitudes are measured from the actual launch location. Use its DEM elevation for
+  // maximum AGL and KML; the lower clearance datum must not hide the extra commanded height.
+  const homeElev = ground(home);
   // Field-measured highest obstacle (absolute), when given. It sets a minimum for the whole flight
   // and RTH (obstacle + minimum clearance); mapping height still follows the terrain where higher.
-  const floorAbs = input.obstacleFloorM > 0 ? homeElev + input.obstacleFloorM : -Infinity;
+  const floorAbs = input.obstacleFloorM > 0 ? clearanceHomeElev + input.obstacleFloorM : -Infinity;
   const treetops = (xy: XY) => obstacle(xy) + input.formationM + input.canopyM;
   const surface = (xy: XY) => Math.max(treetops(xy), floorAbs);
-  const target = (xy: XY) => Math.max(treetops(xy) + input.altitudeM, floorAbs + input.minClearanceM) - homeElev;
+  const target = (xy: XY) => Math.max(treetops(xy) + input.altitudeM, floorAbs + input.minClearanceM) - clearanceHomeElev;
 
   const ls = lineSpacing(camera, input.altitudeM, input.sideOverlap);
   const ps = photoSpacing(camera, input.altitudeM, input.frontOverlap);
@@ -251,7 +264,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     batteryMin: input.batteryMin,
     reservePct: input.reservePct,
   };
-  const need = (xy: XY) => surface(xy) + input.minClearanceM - homeElev;
+  const need = (xy: XY) => surface(xy) + input.minClearanceM - clearanceHomeElev;
 
   /** Climb straight up over takeoff high enough that the leg out clears the trees and needs at most 3 m/s vertical. */
   const climbAltFor = (oriented: Line[]) => {
@@ -288,6 +301,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   let longestLeg = 0;
   let maxAlt = -Infinity;
   let minAlt = Infinity;
+  const returns: { alt: number; lowestGround: number }[] = [];
   const toPts = (w: ItinWp[]): PathPt[] => w.map((p) => ({ xy: p.xy, alt: p.alt }));
   for (const m of missions) {
     const it = itineraryFor(m.lines);
@@ -295,11 +309,11 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     m.climbAltM = it.climbAltM;
     m.itinerary = it.wps;
     m.waypointCount = it.wps.length;
-    const st = pathStats(toPts(it.wps), surface, ground, homeElev, TERRAIN_STEP_M);
+    const st = pathStats(toPts(it.wps), surface, ground, clearanceHomeElev, TERRAIN_STEP_M);
     minClear = Math.min(minClear, st.minClearance);
     const firstLine = it.wps.findIndex((w) => w.kind === 'line');
-    minLineClear = Math.min(minLineClear, pathStats(toPts(it.wps.slice(firstLine)), surface, ground, homeElev, TERRAIN_STEP_M).minClearance);
-    maxAgl = Math.max(maxAgl, st.maxAboveGround);
+    minLineClear = Math.min(minLineClear, pathStats(toPts(it.wps.slice(firstLine)), surface, ground, clearanceHomeElev, TERRAIN_STEP_M).minClearance);
+    maxAgl = Math.max(maxAgl, st.maxAboveGround + homeElev - clearanceHomeElev);
     maxVert = Math.max(maxVert, itineraryMaxVertical(it.wps));
     const ext = legExtremes(it.wps);
     shortestLeg = Math.min(shortestLeg, ext.shortest || Infinity);
@@ -317,7 +331,13 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
         const n = Math.max(1, Math.ceil(dist(a, b) / 20));
         for (let k = 0; k <= n; k++) {
           const p: XY = [a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n];
-          rthNeed = Math.max(rthNeed, maxAlong(p, home, need, 20));
+          let lowestGround = Infinity;
+          rthNeed = Math.max(rthNeed, maxAlong(p, home, (xy) => {
+            lowestGround = Math.min(lowestGround, ground(xy));
+            return need(xy);
+          }, TERRAIN_STEP_M));
+          const alt = it.wps[i].alt + (it.wps[i + 1].alt - it.wps[i].alt) * k / n;
+          returns.push({ alt, lowestGround });
         }
       }
     }
@@ -326,6 +346,9 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   if (terrain && rthNeed > -Infinity) {
     // Re-time each mission with the RTH climb included.
     const rthAltM = Math.ceil(rthNeed / 5) * 5;
+    // RTH stays at the current altitude when it is already above the setting. The minimum ground
+    // on each sampled return also covers the vertical climb at its origin and arrival over home.
+    for (const r of returns) maxAgl = Math.max(maxAgl, homeElev + Math.max(r.alt, rthAltM) - r.lowestGround);
     for (const m of missions) m.timeS = itineraryTime(m.itinerary!, home, { ...timing, rthAltM });
   }
 
@@ -343,6 +366,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     terrainSummary = {
       source: terrain.source,
       homeElevM: homeElev,
+      clearanceHomeElevM: clearanceHomeElev,
       minGroundM: lo,
       maxGroundM: hi,
       rthAltM: Math.ceil(rthNeed / 5) * 5,
@@ -367,7 +391,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     interval,
     worst,
     budget: budgetS(flight),
-    homeToPolygonM: minDistToRing(home, ring),
+    homeToPolygonM,
     minClear,
     minLineClear,
     maxAgl: Math.round(maxAgl * 10) / 10,
@@ -407,30 +431,6 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   };
 }
 
-function minDistToRing(p: [number, number], ring: [number, number][]): number {
-  if (pointInRing(p, ring)) return 0;
-  let best = Infinity;
-  for (let i = 0; i < ring.length; i++) {
-    const a = ring[i];
-    const b = ring[(i + 1) % ring.length];
-    const dx = b[0] - a[0];
-    const dy = b[1] - a[1];
-    const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy || 1)));
-    best = Math.min(best, dist(p, [a[0] + t * dx, a[1] + t * dy]));
-  }
-  return best;
-}
-
-function pointInRing([x, y]: [number, number], ring: [number, number][]): boolean {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i];
-    const [xj, yj] = ring[j];
-    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
-  }
-  return inside;
-}
-
 /** Status for a value where larger is worse. */
 export function grade(value: number, cautionAt: number, failAt: number): CheckStatus {
   if (value > failAt) return 'fail';
@@ -463,6 +463,18 @@ export function runChecks(a: {
 }): Check[] {
   const { input, camera, missions, interval, worst, budget } = a;
   const out: Check[] = [];
+
+  const stale = staleMeasurements(input, input.polygon, input.home);
+  if (input.obstacleFloorM > 0 || input.formationM > 0) {
+    out.push({
+      id: 'measurements',
+      label: 'Field measurements',
+      status: stale.length ? 'fail' : 'pass',
+      detail: stale.length
+        ? `${stale.join(' and ')} must be measured and confirmed for this area and takeoff. Go to Settings to confirm new measurements; old heights cannot authorize export after moving the site.`
+        : 'The field measurements were confirmed for the current area and takeoff.',
+    });
+  }
 
   const maxWp = Math.max(0, ...missions.map((m) => m.waypointCount));
   out.push({
@@ -501,7 +513,7 @@ export function runChecks(a: {
     label: 'Height above ground',
     status: grade(a.maxAgl, input.maxAltitudeM * 0.9, input.maxAltitudeM),
     detail: a.terrain
-      ? `Highest point ${fmt(a.maxAgl)} m above the ground below it (limit ${input.maxAltitudeM} m). That is ${input.altitudeM} m above the trees plus ${input.canopyM} m tree height, more where lines cross dips.`
+      ? `Highest point ${fmt(a.maxAgl)} m above the ground below it, including straight returns from anywhere on the flight (limit ${input.maxAltitudeM} m). This includes the extra height allowed for uncertainty around takeoff and terrain dips.`
       : `${fmt(a.maxAgl)} m above takeoff (limit ${input.maxAltitudeM} m), assuming flat ground.`,
   });
 
@@ -525,7 +537,7 @@ export function runChecks(a: {
     out.push({
       id: 'rth',
       label: 'Return-to-home altitude',
-      status: a.terrain.rthAltM > input.maxAltitudeM ? 'caution' : 'pass',
+      status: a.terrain.rthAltM > input.maxAltitudeM ? 'fail' : 'pass',
       detail: `Set RTH altitude in DJI Fly to at least ${a.terrain.rthAltM} m. That clears the treetops by ${input.minClearanceM} m on a straight line home from any point on the path, checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
     });
   }
@@ -569,6 +581,7 @@ export function runChecks(a: {
     status:
       a.longestLeg > LITCHI_MAX_LEG_M ||
       a.shortestLeg < LITCHI_MIN_LEG_M ||
+      a.minAlt < LITCHI_MIN_ALT_M ||
       a.maxAlt > LITCHI_MAX_ALT_M ||
       a.photoSpacing > LITCHI_MAX_INTERVAL ||
       (input.trigger === 'time' && interval > LITCHI_MAX_INTERVAL)
@@ -578,7 +591,7 @@ export function runChecks(a: {
           : 'pass',
     detail:
       `Legs ${a.shortestLeg.toFixed(1)} to ${a.longestLeg.toFixed(0)} m (Litchi accepts ${LITCHI_MIN_LEG_M} to ${LITCHI_MAX_LEG_M} m). ` +
-      `Altitudes ${a.minAlt.toFixed(0)} to ${a.maxAlt.toFixed(0)} m above takeoff (Hub import limit ${LITCHI_MAX_ALT_M} m). ` +
+      `Altitudes ${a.minAlt.toFixed(0)} to ${a.maxAlt.toFixed(0)} m above takeoff (Hub import limits ${LITCHI_MIN_ALT_M} to ${LITCHI_MAX_ALT_M} m). ` +
       `Photo interval ${input.trigger === 'time' ? `${interval.toFixed(1)} s` : `${a.photoSpacing.toFixed(1)} m`} (limit ${LITCHI_MAX_INTERVAL}).` +
       (a.minAlt < 0 ? ' Some waypoints are below takeoff height; confirm Litchi Hub accepts them after import.' : ''),
   });

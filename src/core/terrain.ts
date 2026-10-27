@@ -3,6 +3,7 @@
  * Pure functions plus a sampler over decoded tiles; fetching lives in the app.
  */
 import type { LngLat } from './projection';
+import { MAX_TERRAIN_TILES, PlanError } from './limits';
 
 export const TERRARIUM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
 export const TILE_SIZE = 256;
@@ -42,11 +43,14 @@ export const tileUrl = (t: TileKey) =>
 
 /** All tiles needed to sample every point inside the bounding box of `points`, plus one pixel of margin. */
 export function tilesFor(points: LngLat[], z = TERRAIN_ZOOM): TileKey[] {
+  if (!Number.isInteger(z) || z < 0 || z > 22) throw new PlanError('The elevation zoom level is invalid.');
   let x0 = Infinity,
     y0 = Infinity,
     x1 = -Infinity,
     y1 = -Infinity;
   for (const p of points) {
+    if (!p.every(Number.isFinite) || Math.abs(p[0]) > 180 || Math.abs(p[1]) >= 85.05112878)
+      throw new PlanError('This area is outside the supported elevation map. Choose a site between 85° south and 85° north.');
     const [x, y] = globalPixel(p, z);
     x0 = Math.min(x0, x);
     y0 = Math.min(y0, y);
@@ -55,10 +59,13 @@ export function tilesFor(points: LngLat[], z = TERRAIN_ZOOM): TileKey[] {
   }
   const out: TileKey[] = [];
   if (!points.length) return out;
-  const tx0 = Math.floor((x0 - 1) / TILE_SIZE);
-  const tx1 = Math.floor((x1 + 1) / TILE_SIZE);
-  const ty0 = Math.floor((y0 - 1) / TILE_SIZE);
-  const ty1 = Math.floor((y1 + 1) / TILE_SIZE);
+  const max = 2 ** z - 1;
+  const tx0 = Math.max(0, Math.floor((x0 - 1) / TILE_SIZE));
+  const tx1 = Math.min(max, Math.floor((x1 + 1) / TILE_SIZE));
+  const ty0 = Math.max(0, Math.floor((y0 - 1) / TILE_SIZE));
+  const ty1 = Math.min(max, Math.floor((y1 + 1) / TILE_SIZE));
+  if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) > MAX_TERRAIN_TILES)
+    throw new PlanError('This needs too many elevation tiles. Split the area or move takeoff closer.');
   for (let x = tx0; x <= tx1; x++) for (let y = ty0; y <= ty1; y++) out.push({ z, x, y });
   return out;
 }

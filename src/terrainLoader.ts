@@ -1,5 +1,6 @@
 /** Fetches and decodes Terrarium elevation tiles in the browser. The service worker caches them for offline use. */
 import { TILE_SIZE, TileData, TileKey, decodeTile, keyOf, tileUrl } from './core/terrain';
+import { MAX_TERRAIN_TILES, PlanError } from './core/limits';
 
 const cache = new Map<string, TileData>();
 const inflight = new Map<string, Promise<TileData>>();
@@ -33,6 +34,7 @@ export function hasTiles(keys: TileKey[]): boolean {
 
 /** Load all tiles in `keys`. Resolves when every tile is decoded; rejects if any fails. */
 export async function loadTiles(keys: TileKey[]): Promise<void> {
+  if (keys.length > MAX_TERRAIN_TILES) throw new PlanError('Too many elevation tiles requested. Split the area or move takeoff closer.');
   await Promise.all(
     keys.map((k) => {
       const id = keyOf(k);

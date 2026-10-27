@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_INPUT, buildPlan, type Plan, type PlanInput } from './plan';
 import { LngLat, XY, dist, makeProjection } from './projection';
 import type { Terrain } from './terrain';
+import { measurementKeys } from './measurements';
 
 const C: LngLat = [98.1, 3.56];
 const proj = makeProjection(C);
@@ -104,6 +105,7 @@ const inputFor = (polygon: LngLat[], home: XY, over: Partial<PlanInput> = {}): P
   ...DEFAULT_INPUT,
   polygon,
   home: ll(home),
+  ...measurementKeys(polygon, ll(home)),
   altitudeM: 80,
   canopyM: 30,
   minClearanceM: 30,

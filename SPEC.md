@@ -64,10 +64,14 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[v1]** Takeoff-point variants: generate the full mission set for up to three alternative takeoff points in one export.
 
 ### 3.4a Rock formations and elevation-data limits (adversarial review, 27 Oct 2026)
-- **[done]** Conservative terrain model: obstacles = highest DEM value within 30 m; takeoff = lowest within 30 m.
+- **[done]** Conservative terrain model: obstacles = highest DEM value within 30 m; clearance design uses the lowest takeoff elevation within 30 m. Maximum height and absolute KML use DEM elevation at the actual takeoff position, including the extra commanded relative height.
 - **[done]** Terrain following climbs before rock faces (profile limited to 2.5 m/s vertical) and never dips more than 1 m below target.
 - **[done]** Steep-terrain detection (DEM slope > 100% over 20 m) blocks export until the user enters a field measurement: "Rock formation height" (added to the elevation data everywhere; keeps terrain following) or "Highest obstacle above takeoff" (a floor, plus minimum clearance, for the flight and RTH). Steepest point marked on the map.
 - **[done]** DJI Fly max altitude setting; export blocked when a waypoint or RTH needs more.
+- **[done]** Field obstacle measurements are bound to exact area/takeoff coordinates; formation measurements are bound to the area. Geometry changes or legacy measurements without context block export until remeasured and confirmed in Settings.
+- **[done]** Maximum height includes returns from positions sampled every 20 m along every flight leg, at the greater of current altitude and RTH setting; return ground is sampled every 10 m.
+- **[done]** Terrain allocation capped at 1,000,000 grid cells and elevation requests at 256 tiles. Invalid bounds and excessive takeoff distance are refused before terrain work.
+- **[done]** A memory-only storage fallback always reports plans as unsaved, including when browser storage is unavailable at startup.
 - **[done]** Flat-ground confirmation only counts for the area it was given for.
 - **[done]** Export screen and report: DJI Fly settings, takeoff rule, safe resume procedure, no obstacle avoidance in Litchi missions.
 - `src/core/adversarial.test.ts`: six rock scenarios (tower, sub-resolution spire, cliff, valley takeoff, misregistered DEM, tower cluster) evaluated against the true surface with a simulated 30 m SRTM.
@@ -108,8 +112,8 @@ Each check returns pass, caution (amber, export allowed with explanation) or fai
 | Climb gradient [v1] | > 4 m/s vertical at planned speed | > 3 m/s |
 | Takeoff point distance to polygon | > limit | > 50% of limit |
 | Elevation data loaded | none or partial, unless flat ground confirmed | flat ground confirmed |
-| Litchi limits | leg < 0.6 m or > 1999 m; altitude > 500 m; photo interval > 100 | waypoint below takeoff |
-| RTH altitude above height limit at takeoff | | yes |
+| Litchi limits | leg < 0.6 m or > 1999 m; altitude < -200 m or > 500 m; photo interval > 100 | supported waypoint below takeoff |
+| RTH height above the configured height limit | yes, including valleys on the return | |
 | GEO zone checked | | not ticked |
 
 ### 3.8 Guidance and UX

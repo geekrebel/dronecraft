@@ -19,7 +19,10 @@ Open the app in Safari, Share → Add to Home Screen. Open it once from the home
 
 ## Limits to know
 - The Air 2S has no onboard waypoints. Litchi flies it by virtual stick, so the mission stops if the controller link drops.
-- Altitude is constant above takeoff until terrain following is added. Only fly current exports on flat sites.
+- With elevation loaded, missions follow a conservative terrain model. Missing elevation blocks export unless you confirm the site is flat. Narrow rocks and trees still need field measurements.
+- Moving the area or takeoff invalidates the relevant field measurements. Remeasure and confirm them in Settings before exporting again; older saved measurements need a first confirmation too.
+- Height checks include the return routes and the extra altitude commanded around uncertain takeoff terrain. Large terrain requests and distant takeoff points are refused before elevation loading.
+- If browser storage is unavailable, a "not saved" warning stays visible. Export your plans before closing the app.
 - Distance-based photo triggering is written to the CSV; confirm it works on your drone in a test flight.
 
 ## Development
