@@ -225,3 +225,28 @@ describe('adversarial: with the highest obstacle measured in the field', () => {
     }
   }
 });
+
+describe('adversarial: with rock formation height measured in the field', () => {
+  // Formation heights above surrounding ground for each scenario.
+  const heights: Record<string, number> = {
+    'karst tower 80 m wide, 150 m sheer walls, mid-block': 150,
+    'rock spire 24 m wide, 110 m tall (below DEM resolution)': 110,
+    'cliff 120 m high crossing every line': 120,
+    'takeoff in a valley 25 m from a 140 m tower': 140,
+    'cliff with DEM misregistered 25 m': 120,
+    'tower cluster, lines across': 160,
+  };
+  for (const s of scenarios) {
+    for (const error of [0, -10]) {
+      it(`${s.name}, formation height ${error === 0 ? 'exact' : `${-error} m too low`}`, () => {
+        const dem = simulatedDem(s.truth, 30, s.offset ?? [0, 0]);
+        const p = buildPlan(inputFor(s.polygon, s.home, { ...s.over, formationM: heights[s.name] + error, droneMaxAltM: 500, speedMs: 3, batteryMin: 31, reservePct: 0.2 }), dem);
+        const c = trueClearance(p, s.truth, 30);
+        const line = `${s.name} formation=${heights[s.name] + error}: blocked=${p.exportBlocked} TRUE flight=${c.flight.toFixed(1)} rth=${c.rth.toFixed(1)}`;
+        console.log(line);
+        expect(c.flight, line).toBeGreaterThan(30 + error - 1.01);
+        expect(c.rth, line).toBeGreaterThan(30 + error - 1.01);
+      });
+    }
+  }
+});

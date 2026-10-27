@@ -46,6 +46,11 @@ export interface PlanInput {
    * 0 = not set. When set, no part of the flight or RTH goes below this plus the minimum clearance.
    */
   obstacleFloorM: number;
+  /**
+   * How far the tallest rock formation rises above the ground around it, metres. Added to the
+   * elevation data everywhere (the data cannot say where narrow formations are). 0 = not set.
+   */
+  formationM: number;
   /** Max altitude set in DJI Fly; the aircraft will not climb above it. */
   droneMaxAltM: number;
 }
@@ -69,6 +74,7 @@ export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
   flatGroundConfirmed: false,
   flatConfirmedFor: '',
   obstacleFloorM: 0,
+  formationM: 0,
   droneMaxAltM: 120,
 };
 
@@ -91,6 +97,7 @@ export const SETTING_RANGES: Record<string, [number, number]> = {
   maxRangeM: [100, 5000],
   maxAltitudeM: [30, 500],
   obstacleFloorM: [0, 500],
+  formationM: [0, 300],
   droneMaxAltM: [20, 500],
 };
 
@@ -223,7 +230,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   // Field-measured highest obstacle (absolute), when given. It sets a minimum for the whole flight
   // and RTH (obstacle + minimum clearance); mapping height still follows the terrain where higher.
   const floorAbs = input.obstacleFloorM > 0 ? homeElev + input.obstacleFloorM : -Infinity;
-  const treetops = (xy: XY) => obstacle(xy) + input.canopyM;
+  const treetops = (xy: XY) => obstacle(xy) + input.formationM + input.canopyM;
   const surface = (xy: XY) => Math.max(treetops(xy), floorAbs);
   const target = (xy: XY) => Math.max(treetops(xy) + input.altitudeM, floorAbs + input.minClearanceM) - homeElev;
 
@@ -528,13 +535,17 @@ export function runChecks(a: {
     out.push({
       id: 'steep',
       label: 'Steep rock formations',
-      status: input.obstacleFloorM > 0 ? 'caution' : 'fail',
+      status: input.obstacleFloorM > 0 || input.formationM > 0 ? 'caution' : 'fail',
       detail:
         `The elevation data has slopes up to ${pct}% here, which usually means cliffs or rock towers. ` +
         'SRTM elevation is averaged over 30 m, so towers and spires narrower than about 60 m appear much lower than they are and terrain following cannot see them. ' +
-        (input.obstacleFloorM > 0
-          ? `You set the highest obstacle to ${input.obstacleFloorM} m above takeoff, so nothing in the flight or RTH goes below ${input.obstacleFloorM + input.minClearanceM} m above takeoff. That is only as safe as that measurement.`
-          : 'Export is blocked until you set "Highest obstacle above takeoff" in Settings. Measure it on site: climb straight up over takeoff until you are clearly above the tallest formation and treetops, and read the altitude in DJI Fly.'),
+        (input.obstacleFloorM > 0 || input.formationM > 0
+          ? [
+              input.formationM > 0 ? `Rock formations allowed for: ${input.formationM} m above the surrounding ground, added everywhere.` : '',
+              input.obstacleFloorM > 0 ? `Highest obstacle: ${input.obstacleFloorM} m above takeoff, so nothing in the flight or RTH goes below ${input.obstacleFloorM + input.minClearanceM} m above takeoff.` : '',
+              'This is only as safe as those measurements.',
+            ].filter(Boolean).join(' ')
+          : 'Export is blocked until you set "Rock formation height" or "Highest obstacle above takeoff" in Settings, measured on site.'),
     });
   }
 
