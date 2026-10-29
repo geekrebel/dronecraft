@@ -13,7 +13,7 @@ const doc = (name: string, over: Partial<PlanDoc<typeof D>> = {}): PlanDoc<typeo
   id: 'x',
   name,
   polygon: poly,
-  home: [98.105, 3.49],
+  home: [98.105, 3.499],
   settings: { ...D, altitudeM: 95, trigger: 'time', gridAngleDeg: 30 },
   updatedAt: 1,
   ...over,
@@ -26,7 +26,7 @@ describe('plan file', () => {
     expect(skipped).toEqual([]);
     expect(plans.map((p) => p.name)).toEqual(['A', 'B']);
     expect(plans[0].polygon).toEqual(poly);
-    expect(plans[0].home).toEqual([98.105, 3.49]);
+    expect(plans[0].home).toEqual([98.105, 3.499]);
     expect(plans[1].home).toBeNull();
     expect(plans[0].settings.altitudeM).toBe(95);
     expect(plans[0].settings.trigger).toBe('time');

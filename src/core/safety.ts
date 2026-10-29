@@ -10,19 +10,13 @@
  * - the steepest DEM slope, used to detect rock formations the data cannot represent.
  */
 import type { XY } from './projection';
+import { Bounds, gridSize } from './limits';
 
 export const SAFETY_RADIUS_M = 30;
 export const GRID_STEP_M = 10;
 /** DEM slope (rise per metre over 20 m) above which narrow rock formations are likely underestimated. */
 export const STEEP_SLOPE = 1;
 
-
-export interface Bounds {
-  x0: number;
-  y0: number;
-  x1: number;
-  y1: number;
-}
 
 export class SafeTerrain {
   private nx: number;
@@ -39,8 +33,9 @@ export class SafeTerrain {
     private radiusM = SAFETY_RADIUS_M,
     private step = GRID_STEP_M,
   ) {
-    this.nx = Math.max(2, Math.ceil((b.x1 - b.x0) / step) + 1);
-    this.ny = Math.max(2, Math.ceil((b.y1 - b.y0) / step) + 1);
+    const size = gridSize(b, step);
+    this.nx = size.nx;
+    this.ny = size.ny;
     const N = this.nx * this.ny;
     this.raw = new Float64Array(N);
     for (let j = 0; j < this.ny; j++)
@@ -72,6 +67,7 @@ export class SafeTerrain {
           Math.abs(this.raw[j * this.nx + i + d] - v) / (d * step),
           Math.abs(this.raw[(j + d) * this.nx + i] - v) / (d * step),
           Math.abs(this.raw[(j + d) * this.nx + i + d] - v) / (d * step * Math.SQRT2),
+          Math.abs(this.raw[(j + d) * this.nx + i] - this.raw[j * this.nx + i + d]) / (d * step * Math.SQRT2),
         ];
         const c = Math.max(...cands);
         if (c > s) {

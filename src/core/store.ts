@@ -1,5 +1,7 @@
 /** Saved flight plans, kept in a key-value storage (localStorage in the app, a Map in tests). */
 export interface KV {
+  /** False for a temporary memory fallback. Omitted by persistent test/adaptor stores. */
+  readonly durable?: boolean;
   getItem(k: string): string | null;
   setItem(k: string, v: string): void;
 }
@@ -40,15 +42,16 @@ export class PlanStore<S> {
       /* corrupt or unavailable: start empty */
     }
     this.data = d && d.plans ? d : { current: null, plans: {} };
+    this.saved = kv.durable !== false;
   }
 
-  /** False after a write failed (storage full or blocked); true again after the next successful write. */
-  saved = true;
+  /** True only after a durable write succeeds; memory-only sessions remain unsaved. */
+  saved: boolean;
 
   private persist() {
     try {
       this.kv.setItem(STORE_KEY, JSON.stringify(this.data));
-      this.saved = true;
+      this.saved = this.kv.durable !== false;
     } catch {
       // Keep working in memory, but let the app tell the user their changes are not stored.
       this.saved = false;

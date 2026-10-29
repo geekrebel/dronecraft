@@ -71,7 +71,8 @@ describe('buildPlan with terrain', () => {
     expect(p.terrainStatus).toBe('loaded');
     const homeTrue = 100 + 0.3 * -180;
     // Lowest ground within 30 m of takeoff on a 0.3 slope is 9 m below it.
-    expect(p.terrain!.homeElevM).toBeCloseTo(homeTrue - 9, 6);
+    expect(p.terrain!.homeElevM).toBeCloseTo(homeTrue, 6);
+    expect(p.terrain!.clearanceHomeElevM).toBeCloseTo(homeTrue - 9, 6);
     for (const m of p.missions)
       for (const l of m.lines)
         for (const w of l.wps!) {
