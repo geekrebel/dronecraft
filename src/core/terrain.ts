@@ -74,6 +74,7 @@ export function tilesFor(points: LngLat[], z = TERRAIN_ZOOM): TileKey[] {
 export type TileData = Float32Array;
 
 export function decodeTile(rgba: Uint8ClampedArray | Uint8Array): TileData {
+  if (rgba.length !== TILE_SIZE * TILE_SIZE * 4) throw new PlanError('Elevation tile has an invalid size. Reload the terrain before exporting.');
   const out = new Float32Array(TILE_SIZE * TILE_SIZE);
   for (let i = 0; i < out.length; i++) out[i] = decodeTerrarium(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
   return out;

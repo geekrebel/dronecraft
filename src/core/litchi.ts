@@ -75,6 +75,7 @@ const r = (v: number, d: number) => Number(v.toFixed(d));
 export function toLitchiCsv(wps: LitchiWaypoint[]): string {
   const rows = [LITCHI_HEADER.join(',')];
   for (const w of wps) {
+    if (!Object.values(w).every(Number.isFinite)) throw new Error('Cannot export a waypoint with an invalid number. Regenerate the plan.');
     const actions = Array.from({ length: 15 }, () => ['-1', '0']).flat();
     rows.push(
       [

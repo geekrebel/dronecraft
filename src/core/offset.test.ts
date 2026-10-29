@@ -1,7 +1,6 @@
 /**
- * Field workflow: export at a base rock formation height F0, then on site raise every waypoint in
- * Litchi by d = measured - F0 (batch edit, altitude relative to "Current"). This must equal
- * exporting at F0 + d, apart from battery time and the RTH altitude, which the app recomputes.
+ * Profile translation holds in these generous battery/height fixtures. It does not authorize
+ * manual edits: changing field heights requires replanning, which can change battery splits.
  */
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_INPUT, buildPlan } from './plan';
@@ -17,7 +16,7 @@ const hills = new FunctionTerrain((p) => {
 });
 const input = { ...DEFAULT_INPUT, polygon: poly, home: ll([0, -150]), canopyM: 30, droneMaxAltM: 500, maxAltitudeM: 500, maxRangeM: 2000, batteryMin: 31, reservePct: 0.2 };
 
-describe('raising all waypoints in Litchi by d equals exporting with formation height + d', () => {
+describe('formation profile translation when mission partitions remain unchanged', () => {
   for (const [f0, d] of [[10, 40], [20, 100], [5, 150]]) {
     it(`base ${f0} m, raised by ${d} m`, () => {
       const base = buildPlan({ ...input, formationM: f0 }, hills);

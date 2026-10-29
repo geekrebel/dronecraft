@@ -12,6 +12,7 @@ import { defaultHome, edgeMidpoints, polygonAreaM2, squareAround, translate } fr
 import { PlanDoc, PlanStore, uniqueName } from './core/store';
 import { safeStorage } from './core/storage';
 import { measurementKeys } from './core/measurements';
+import { HEIGHT_CHANGE_GUIDANCE, RESUME_GUIDANCE, RTH_GUIDANCE } from './core/guidance';
 import { checkTakeoffDistance, gridSize } from './core/limits';
 import { areaProblem, parsePlansFile, serializePlans } from './core/planfile';
 import { TERRAIN_ZOOM, Terrain, TileKey, TileTerrain, tilesFor } from './core/terrain';
@@ -666,7 +667,10 @@ function renderStep() {
         ${slider('canopyM', 'Tree height', 0, 70, 1, 'm', 'Added to ground elevation to estimate the treetops. Use the tallest trees, not the average. Lowland Sumatran forest has emergents of 50 to 60 m. Set 0 for open ground.')}
         ${slider('minClearanceM', 'Minimum clearance', 10, 60, 1, 'm', 'Smallest allowed gap between the drone and the estimated treetops anywhere on the path. The Air 2S cannot sense obstacles to the side, so keep a margin for trees taller than you allowed for.')}
         ${slider('formationM', 'Rock formation height', 0, 300, 5, 'm', 'How far the tallest rock tower or cliff rises above the ground around it. Added to the elevation data everywhere, so the drone still follows the terrain but stays clear of formations the data cannot see (anything narrower than about 60 m). Measure it: hover level with the base of the tallest formation, climb until level with its top, and take the difference in DJI Fly altitude. 0 = not set.')}${measurementConfirmation('formationM')}
-        ${slider('obstacleFloorM', 'Highest obstacle above takeoff', 0, 400, 5, 'm', 'The tallest rock formation or tree top in or near the area, in metres above your takeoff point. Required where the app detects cliffs or rock towers, because the elevation data cannot see formations narrower than about 60 m. Measure it: climb straight up over takeoff until you are clearly above the tallest top and read the altitude in DJI Fly. 0 = not set.')}${measurementConfirmation('obstacleFloorM')}
+        ${slider('obstacleFloorM', 'Highest obstacle above takeoff', 0, 400, 5, 'm', 'The tallest rock formation or tree top along any flight or return corridor, in metres above takeoff. Use a verified field measurement; the elevation data can miss narrow formations even on gentle slopes. 0 means no additional obstacle floor.')}${measurementConfirmation('obstacleFloorM')}
+        <div class="banner ${s.siteSurveyedFor === measurementKeys(state.polygon, state.home).siteSurveyedFor ? 'pass' : 'caution'}"><b>Required site survey</b><p>Inspect the entire flight area, climb-out and return corridors for rocks, trees and wires. Enter measured height allowances above, including tree height. Verify that at least 5 m around takeoff is clear for immediate landing. Only leave height allowances at zero if your survey confirms they are unnecessary.</p>
+        <button class="btn" id="confirmsurvey" ${state.home ? '' : 'disabled'}>${s.siteSurveyedFor === measurementKeys(state.polygon, state.home).siteSurveyedFor ? 'Survey confirmed for this site' : 'I surveyed this site and confirmed the allowances and clear landing area'}</button></div>
+        <p class="hint">${HEIGHT_CHANGE_GUIDANCE}</p>
         ${slider('frontOverlap', 'Front overlap', 0.6, 0.9, 0.01, '%', 'How much each photo overlaps the next along a line. 80% suits forest, where leaves move and texture repeats.')}
         ${slider('sideOverlap', 'Side overlap', 0.6, 0.9, 0.01, '%', 'How much neighbouring lines overlap. Sets line spacing exactly. 80% for forest.')}
         ${slider('speedMs', 'Speed', 2, 12, 0.5, 'm/s', 'Ground speed on mapping lines. Slower is smoother and gives sharper photos. The Air 2S needs at least 2 s between photos, so too fast turns the interval check red.')}
@@ -687,6 +691,10 @@ function renderStep() {
         <div class="row" style="margin-top:16px"><button class="btn" id="resetsettings">Reset settings to defaults</button></div>
         <p class="hint">Resets flight settings and limits only. The area and takeoff point stay as they are.</p>`;
       bindSliders();
+      on('confirmsurvey', () => {
+        state.settings.siteSurveyedFor = measurementKeys(state.polygon, state.home).siteSurveyedFor;
+        update();
+      });
       $body.querySelectorAll<HTMLElement>('[data-confirm-measurement]').forEach((b) => b.addEventListener('click', () => {
         const key = b.dataset.confirmMeasurement as 'obstacleFloorM' | 'formationM';
         const context = key === 'obstacleFloorM' ? 'obstacleMeasuredFor' : 'formationMeasuredFor';
@@ -796,13 +804,13 @@ function renderStep() {
           </ul></div>
         <div class="banner fail"><b>Before every flight, in DJI Fly</b>:
           <ul>
-            ${p.terrain ? `<li>RTH altitude <b>${p.terrain.rthAltM} m</b>. When a mission ends with Go Home, or the link drops, the drone climbs at up to 6 m/s to this altitude if it is lower, then flies straight home. If it is already higher, it returns at its current altitude. Setting more than this only costs time and battery.</li>` : ''}
-            <li>Max altitude at least <b>${Math.ceil(Math.max(p.terrain?.rthAltM ?? 0, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m</b> (and the same in Litchi). The drone will not climb past it.</li>
+            <li>RTH altitude <b>${p.rthAltM} m</b>. ${RTH_GUIDANCE}</li>
+            <li>Max altitude at least <b>${Math.ceil(Math.max(p.rthAltM, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m</b> (and the same in Litchi). The drone will not climb past it.</li>
             <li>Signal lost action: <b>RTH</b>, not hover.</li>
-            <li>If DJI Fly offers an RTH path option (Optimal / Preset), choose <b>Preset</b> so it climbs to RTH altitude before flying home.</li>
           </ul>
           <b>Takeoff</b>: launch at the planned takeoff point, never lower. Altitudes are measured from where the drone takes off; launching 10 m lower puts the whole flight 10 m closer to the rocks.<br>
-          <b>Resuming after a battery swap</b>: do not start straight from the stopped waypoint, because Litchi flies a straight line to it that nothing has checked. Climb over takeoff to the RTH altitude, fly at that altitude until you are directly above the stopped waypoint, then start the mission from that waypoint.<br>
+          <b>Resuming after a battery swap</b>: ${RESUME_GUIDANCE}<br>
+          ${HEIGHT_CHANGE_GUIDANCE}<br>
           Obstacle avoidance does not work during Litchi missions. Keep the drone in sight near rock faces.</div>
         ${p.missions
           .map(
@@ -861,6 +869,7 @@ function bindSliders() {
     el.addEventListener('input', () => {
       const key = el.dataset.key as keyof Settings;
       (state.settings as any)[key] = Number(el.value);
+      if (key === 'obstacleFloorM' || key === 'formationM' || key === 'canopyM') state.settings.siteSurveyedFor = '';
       if (key === 'obstacleFloorM' || key === 'formationM') {
         const context = key === 'obstacleFloorM' ? 'obstacleMeasuredFor' : 'formationMeasuredFor';
         state.settings[context] = measurementKeys(state.polygon, state.home)[context];
@@ -1134,7 +1143,7 @@ function reportFile(): File {
   L.push(`DroneCraft plan: ${state.name}`, `Generated ${new Date().toISOString()}`, '');
   L.push(`Takeoff: ${state.home![1].toFixed(6)}, ${state.home![0].toFixed(6)}`);
   L.push(
-    `Rock formation height: ${s.formationM} m. If you measure taller formations on site, raise ALL waypoints in Litchi by the difference (select all, Edit, Altitude relative to "Current", +difference), and raise DJI Fly max altitude and RTH altitude by the same amount. Never lower.`,
+    `Rock formation height: ${s.formationM} m. ${HEIGHT_CHANGE_GUIDANCE}`,
     `Highest obstacle above takeoff: ${s.obstacleFloorM > 0 ? `${s.obstacleFloorM} m` : 'not set'}`,
   );
   L.push(`Height above trees: ${s.altitudeM} m (tree height ${s.canopyM} m, minimum clearance ${s.minClearanceM} m)`, `Overlap front/side: ${Math.round(s.frontOverlap * 100)}% / ${Math.round(s.sideOverlap * 100)}%`);
@@ -1144,7 +1153,7 @@ function reportFile(): File {
   if (p.terrain) {
     L.push(`Elevation: ${p.terrain.source}`, `Takeoff elevation: ${p.terrain.homeElevM.toFixed(0)} m, ground under lines ${p.terrain.minGroundM.toFixed(0)} to ${p.terrain.maxGroundM.toFixed(0)} m`);
     L.push(`Lowest clearance above trees: ${p.minLineClearanceM.toFixed(0)} m on lines, ${p.minClearanceM.toFixed(0)} m overall`, `Recommended RTH altitude: ${p.terrain.rthAltM} m`);
-  } else L.push('Elevation: not loaded, altitudes assume flat ground');
+  } else L.push('Elevation: not loaded, altitudes assume flat ground', `Recommended RTH altitude: ${p.rthAltM} m`);
   L.push('');
   L.push('MISSIONS');
   p.missions.forEach((m) =>
@@ -1162,10 +1171,11 @@ function reportFile(): File {
     'Camera: JPEG or RAW+JPEG, exposure locked, focus infinity, gimbal -90',
     `SD card has room for ${p.photoCount} photos (about ${((p.photoCount * 9) / 1024).toFixed(1)} GB)`,
     `${p.missions.length} batteries charged`,
-    ...(p.terrain ? [`RTH altitude in DJI Fly set to at least ${p.terrain.rthAltM} m`] : []),
+    `RTH altitude in DJI Fly set to ${p.rthAltM} m`,
     'Launch from the planned takeoff point, never lower, GPS locked, line of sight to the far corner',
-    `DJI Fly: max altitude at least ${Math.ceil(Math.max(p.terrain?.rthAltM ?? 0, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m (same in Litchi), signal lost action RTH, RTH path Preset if offered`,
-    'If a mission stops: note the waypoint, swap battery, climb over takeoff to RTH altitude, fly at that altitude to directly above the stopped waypoint, then start from that waypoint',
+    `DJI Fly: max altitude at least ${Math.ceil(Math.max(p.rthAltM, ...p.missions.flatMap((m) => m.itinerary!.map((w) => w.alt))) / 10) * 10} m (same in Litchi), signal lost action RTH`,
+    RTH_GUIDANCE,
+    RESUME_GUIDANCE,
     'Obstacle avoidance is off during Litchi missions; keep the drone in sight near rock faces',
   ].forEach((t) => L.push(`  [ ] ${t}`));
   return new File([L.join('\n') + '\n'], `${slug()}-report.txt`, { type: 'text/plain' });

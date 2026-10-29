@@ -16,6 +16,7 @@ import type { Terrain } from './terrain';
 import { SAFETY_RADIUS_M, STEEP_SLOPE, SafeTerrain } from './safety';
 import { PlanError, checkTakeoffDistance } from './limits';
 import { staleMeasurements } from './measurements';
+import { Air2sReturns } from './rth';
 export { PlanError } from './limits';
 
 export interface PlanInput {
@@ -58,6 +59,8 @@ export interface PlanInput {
   formationM: number;
   /** Surveyed area for which formation height was measured and confirmed. */
   formationMeasuredFor: string;
+  /** Survey of all flight/return corridors and a clear landing area at least 5 m around home. */
+  siteSurveyedFor: string;
   /** Max altitude set in DJI Fly; the aircraft will not climb above it. */
   droneMaxAltM: number;
 }
@@ -84,6 +87,7 @@ export const DEFAULT_INPUT: Omit<PlanInput, 'polygon' | 'home'> = {
   obstacleMeasuredFor: '',
   formationM: 0,
   formationMeasuredFor: '',
+  siteSurveyedFor: '',
   droneMaxAltM: 120,
 };
 
@@ -154,6 +158,8 @@ export interface TerrainSummary {
   maxSlope: number;
   /** Where it is. */
   maxSlopeAt: LngLat;
+  /** Clearance shortfall on near-home returns or the signal-loss retrace. */
+  returnShortfallM: number;
 }
 
 export type CheckStatus = 'pass' | 'caution' | 'fail';
@@ -191,6 +197,8 @@ export interface Plan {
   maxAboveGroundM: number;
   maxVerticalMs: number;
   homeXY: XY;
+  /** Air 2S Straight Line RTH setting, also available for confirmed flat-ground plans. */
+  rthAltM: number;
 }
 
 class MissingElevation extends Error {}
@@ -224,6 +232,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     if (!terrain) return 0;
     const h = terrain.elevation(proj.toLngLat(xy));
     if (h === null) throw new MissingElevation();
+    if (!Number.isFinite(h)) throw new PlanError('Elevation data contains an invalid height. Reload the terrain before exporting.');
     return h;
   };
   // Conservative model (see safety.ts): highest ground within 30 m for obstacles, lowest within
@@ -301,7 +310,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
   let longestLeg = 0;
   let maxAlt = -Infinity;
   let minAlt = Infinity;
-  const returns: { alt: number; lowestGround: number }[] = [];
+  const returns = new Air2sReturns(home, need, ground);
   const toPts = (w: ItinWp[]): PathPt[] => w.map((p) => ({ xy: p.xy, alt: p.alt }));
   for (const m of missions) {
     const it = itineraryFor(m.lines);
@@ -322,39 +331,15 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
       maxAlt = Math.max(maxAlt, w.alt);
       minAlt = Math.min(minAlt, w.alt);
     }
-    if (terrain) {
-      // RTH can start anywhere on the path, not just at waypoints. DJI RTH climbs to the RTH altitude
-      // only if the drone is below it, then flies straight home; if it is already higher it returns at
-      // its current altitude. So the RTH altitude only has to cover points where the drone's own
-      // altitude would not clear the straight line home. Sample every 20 m along every leg.
-      for (let i = 0; i + 1 < it.wps.length; i++) {
-        const a = it.wps[i];
-        const b = it.wps[i + 1];
-        const n = Math.max(1, Math.ceil(dist(a.xy, b.xy) / 20));
-        for (let k = 0; k <= n; k++) {
-          const t = k / n;
-          const p: XY = [a.xy[0] + (b.xy[0] - a.xy[0]) * t, a.xy[1] + (b.xy[1] - a.xy[1]) * t];
-          let lowestGround = Infinity;
-          const required = maxAlong(p, home, (xy) => {
-            lowestGround = Math.min(lowestGround, ground(xy));
-            return need(xy);
-          }, TERRAIN_STEP_M);
-          const alt = a.alt + (b.alt - a.alt) * t;
-          if (alt < required) rthNeed = Math.max(rthNeed, required);
-          returns.push({ alt, lowestGround });
-        }
-      }
-      // Never below what is needed directly over takeoff, nor below DJI's 20 m minimum.
-      rthNeed = Math.max(rthNeed, need(home), 20);
-    }
+    returns.add(it.wps);
+    rthNeed = returns.settingM;
   }
-  if (!terrain && input.obstacleFloorM > 0) rthNeed = input.obstacleFloorM + input.minClearanceM;
-  if (terrain && rthNeed > -Infinity) {
+  if (rthNeed > -Infinity) {
     // Re-time each mission with the RTH climb included.
     const rthAltM = Math.ceil(rthNeed / 5) * 5;
     // RTH stays at the current altitude when it is already above the setting. The minimum ground
     // on each sampled return also covers the vertical climb at its origin and arrival over home.
-    for (const r of returns) maxAgl = Math.max(maxAgl, homeElev + Math.max(r.alt, rthAltM) - r.lowestGround);
+    maxAgl = Math.max(maxAgl, returns.maxAgl(homeElev, rthAltM));
     for (const m of missions) m.timeS = itineraryTime(m.itinerary!, home, { ...timing, rthAltM });
   }
 
@@ -378,6 +363,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
       rthAltM: Math.ceil(rthNeed / 5) * 5,
       maxSlope: safe!.maxSlope,
       maxSlopeAt: proj.toLngLat(safe!.maxSlopeAt),
+      returnShortfallM: returns.shortfallM,
     };
   }
 
@@ -409,6 +395,7 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     maxAlt,
     minAlt,
     photoSpacing: ps,
+    returnShortfall: returns.shortfallM,
   });
 
   return {
@@ -434,11 +421,13 @@ function build(input: PlanInput, terrain: Terrain | null, missing: 'none' | 'inc
     maxAboveGroundM: maxAgl,
     maxVerticalMs: maxVert,
     homeXY: home,
+    rthAltM: Math.ceil(rthNeed / 5) * 5,
   };
 }
 
 /** Status for a value where larger is worse. */
 export function grade(value: number, cautionAt: number, failAt: number): CheckStatus {
+  if (!Number.isFinite(value)) return 'fail';
   if (value > failAt) return 'fail';
   if (value > cautionAt) return 'caution';
   return 'pass';
@@ -466,11 +455,28 @@ export function runChecks(a: {
   maxAlt: number;
   minAlt: number;
   photoSpacing: number;
+  returnShortfall?: number;
 }): Check[] {
   const { input, camera, missions, interval, worst, budget } = a;
   const out: Check[] = [];
+  const finite = [interval, worst, budget, a.homeToPolygonM, a.minClear, a.minLineClear, a.maxAgl, a.maxVert, a.shortestLeg, a.longestLeg, a.maxAlt, a.minAlt, a.photoSpacing, a.returnShortfall ?? 0,
+    ...(a.terrain ? [a.terrain.homeElevM, a.terrain.rthAltM, a.terrain.minGroundM, a.terrain.maxGroundM] : []),
+    ...missions.flatMap((m) => [m.timeS, ...m.itinerary?.flatMap((w) => [...w.xy, w.alt, w.speed, w.heading]) ?? []])].every(Number.isFinite);
+  out.push({ id: 'numbers', label: 'Valid flight numbers', status: finite ? 'pass' : 'fail', detail: finite ? 'Flight coordinates, heights and timing are finite.' : 'The plan contains an invalid flight number. Regenerate it before export.' });
 
   const stale = staleMeasurements(input, input.polygon, input.home);
+  out.push({
+    id: 'survey', label: 'Site and landing survey',
+    status: input.siteSurveyedFor === JSON.stringify([input.polygon, input.home]) ? 'pass' : 'fail',
+    detail: 'Survey the full flight area, climb-out and return corridors for narrow rocks, trees and wires; enter measured height allowances in Settings. Confirm a clear landing area at least 5 m around takeoff. Elevation data and gentle slopes cannot prove a site is clear.',
+  });
+  out.push({
+    id: 'return-clearance', label: 'Air 2S near-home and signal-loss return',
+    status: (a.returnShortfall ?? 0) > 0.05 ? 'fail' : 'pass',
+    detail: (a.returnShortfall ?? 0) > 0.05
+      ? `The near-home return or 50 m signal-loss retrace lacks ${fmt(a.returnShortfall!)} m of clearance. Raising the RTH setting cannot fix it. Move takeoff or increase the planned clearance and regenerate.`
+      : 'Sampled Air 2S Straight Line RTH: current altitude at 5–50 m from home, climb when farther away, and up to 50 m of signal-loss retracing. Within 5 m the aircraft may land immediately; the landing area must be surveyed clear. Decline Power Saving RTH; other aircraft and return modes are not covered.',
+  });
   if (input.obstacleFloorM > 0 || input.formationM > 0) {
     out.push({
       id: 'measurements',
@@ -544,7 +550,7 @@ export function runChecks(a: {
       id: 'rth',
       label: 'Return-to-home altitude',
       status: a.terrain.rthAltM > input.maxAltitudeM ? 'fail' : 'pass',
-      detail: `Set RTH altitude in DJI Fly to ${a.terrain.rthAltM} m. With it, a return home from any point on the path clears the treetops by ${input.minClearanceM} m: where the drone is already higher it returns at its own altitude, elsewhere it climbs to this first. Checked every 20 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` Arriving back over takeoff at that altitude puts the drone above your ${input.maxAltitudeM} m height limit there. Launching from higher ground lowers it.` : ''}`,
+      detail: `Set Air 2S Straight Line RTH altitude in DJI Fly to ${a.terrain.rthAltM} m. This covers returns starting farther than 50 m from home, including sampled signal-loss retraces. Near-home clearance is checked separately because the aircraft does not climb to this setting at 5–50 m. Return terrain is sampled every 5 m.${a.terrain.rthAltM > input.maxAltitudeM ? ` This exceeds your ${input.maxAltitudeM} m height limit over takeoff.` : ''}`,
     });
   }
 

@@ -52,7 +52,7 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[MVP, done]** Altitude setting is height above the treetops. Tree height setting is added to ground elevation to estimate treetops.
 - **[MVP, done]** Terrain following: sample each line every 10 m, insert waypoints where straight-line interpolation deviates from the target by more than 5 m.
 - **[MVP, done]** Climb waypoint above takeoff, only as high as needed to clear the trees to the first line.
-- **[MVP, done]** Clearance checked every 10 m along every leg (lines, turns, climb-out); height above bare ground vs legal limit; vertical speed per leg; recommended RTH altitude covering a straight return from any waypoint.
+- **[MVP, done]** Clearance checked every 10 m along every leg (lines, turns, climb-out); height above bare ground vs legal limit; vertical speed per leg; documented Air 2S Straight Line and signal-loss return branches checked as detailed below.
 - **[v1]** User-supplied GeoTIFF DEM (DEMNAS) and canopy height raster (ETH global canopy height).
 - **[v1]** Elevation profile chart per line.
 - Note: SRTM is radar and in dense forest records a surface partway up the canopy, so ground + tree height overestimates treetops there. That errs on the safe side.
@@ -69,11 +69,13 @@ Status legend: **[MVP]** first release, **[v1]** before the Sumatra trip, **[v2]
 - **[done]** Steep-terrain detection (DEM slope > 100% over 20 m) blocks export until the user enters a field measurement: "Rock formation height" (added to the elevation data everywhere; keeps terrain following) or "Highest obstacle above takeoff" (a floor, plus minimum clearance, for the flight and RTH). Steepest point marked on the map.
 - **[done]** DJI Fly max altitude setting; export blocked when a waypoint or RTH needs more.
 - **[done]** Field obstacle measurements are bound to exact area/takeoff coordinates; formation measurements are bound to the area. Geometry changes or legacy measurements without context block export until remeasured and confirmed in Settings.
-- **[done]** Maximum height includes returns from positions sampled every 20 m along every flight leg, at the greater of current altitude and RTH setting; return ground is sampled every 10 m.
+- **[done]** Air 2S Straight Line RTH checks current-altitude returns at 5–50 m and climb-to-setting returns beyond 50 m. Flight positions are sampled every 1 m near home and up to 5 m elsewhere; return ground every 5 m. Signal-loss validation covers up to 50 m of historical retracing, including fixed trigger altitude and historical altitude envelopes, and direct returns if the link recovers mid-retrace. Maximum height includes these paths. This sampled model does not certify other aircraft or Power Saving RTH.
+- **[done]** Every site requires an explicit geometry-bound survey of the flight/return corridors and a clear landing area at least 5 m around takeoff, independently of DEM steepness or zero obstacle allowances. Legacy plans need a first survey confirmation. Updating height allowances requires reconfirmation.
+- **[done]** Invalid/nonfinite elevation samples throw a planning error, including with a flat fallback confirmation. CSV and KML independently reject nonfinite flight numbers; malformed tile dimensions are rejected before decoding.
 - **[done]** Terrain allocation capped at 1,000,000 grid cells and elevation requests at 256 tiles. Invalid bounds and excessive takeoff distance are refused before terrain work.
 - **[done]** A memory-only storage fallback always reports plans as unsaved, including when browser storage is unavailable at startup.
 - **[done]** Flat-ground confirmation only counts for the area it was given for.
-- **[done]** Export screen and report: DJI Fly settings, takeoff rule, safe resume procedure, no obstacle avoidance in Litchi missions.
+- **[done]** Export screen and report: DJI Fly settings and documented Air 2S return branches; require fresh missions from takeoff after interruption or changed field heights. Manual waypoint offsets invalidate the checks and timing. No unvalidated transit to stopped waypoints or obstacle avoidance in Litchi missions.
 - `src/core/adversarial.test.ts`: six rock scenarios (tower, sub-resolution spire, cliff, valley takeoff, misregistered DEM, tower cluster) evaluated against the true surface with a simulated 30 m SRTM.
 
 ### 3.5a Itinerary
