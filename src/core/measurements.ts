@@ -12,6 +12,7 @@ export function measurementKeys(polygon: LngLat[], home: LngLat | null) {
   return {
     obstacleMeasuredFor: JSON.stringify([polygon, home]),
     formationMeasuredFor: JSON.stringify(polygon),
+    siteSurveyedFor: JSON.stringify([polygon, home]),
   };
 }
 

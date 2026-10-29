@@ -248,7 +248,8 @@ describe('checks', () => {
     expect(grade(10, 9, 10)).toBe('caution');
     expect(grade(10.01, 9, 10)).toBe('fail');
   });
-  const base = { ...DEFAULT_INPUT, polygon: blockLL(400, 300), home: proj0.toLngLat([0, 0]), flatGroundConfirmed: true };
+  const base = { ...DEFAULT_INPUT, polygon: blockLL(400, 300), home: proj0.toLngLat([0, 0]), flatGroundConfirmed: true,
+    siteSurveyedFor: JSON.stringify([blockLL(400, 300), proj0.toLngLat([0, 0])]) };
   const status = (p: ReturnType<typeof buildPlan>, id: string) => p.checks.find((c) => c.id === id)?.status;
 
   it('photo interval below 2 s fails and blocks export', () => {
@@ -262,7 +263,7 @@ describe('checks', () => {
     const speed = p0.photoSpacingM / 2.2;
     expect(status(buildPlan({ ...base, speedMs: speed }), 'interval')).toBe('caution');
   });
-  it('defaults pass without blocking', () => {
+  it('defaults pass on a surveyed, confirmed flat site', () => {
     const p = buildPlan(base);
     expect(p.exportBlocked).toBe(false);
     expect(status(p, 'interval')).toBe('pass');

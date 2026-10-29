@@ -12,6 +12,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
  */
 export function toKml(plan: Plan, name: string): string {
   const { proj, input } = plan;
+  if (![...input.home, ...input.polygon.flat()].every(Number.isFinite)) throw new Error('Cannot export a path with an invalid number. Regenerate the plan.');
   const abs = plan.terrain !== null;
   const base = plan.terrain?.homeElevM ?? 0;
   const mode = abs ? 'absolute' : 'relativeToGround';
@@ -19,7 +20,10 @@ export function toKml(plan: Plan, name: string): string {
   const styles = COLORS.map(
     (c, i) => `<Style id="m${i}"><LineStyle><color>${c}</color><width>3</width></LineStyle></Style>`,
   ).join('');
-  const c = ([lon, lat]: [number, number], alt: number) => `${lon},${lat},${(base + alt).toFixed(1)}`;
+  const c = ([lon, lat]: [number, number], alt: number) => {
+    if (![lon, lat, base, alt].every(Number.isFinite)) throw new Error('Cannot export a path with an invalid number. Regenerate the plan.');
+    return `${lon},${lat},${(base + alt).toFixed(1)}`;
+  };
   const placemarks = plan.missions
     .map((m, i) => {
       const pts: string[] = [];
